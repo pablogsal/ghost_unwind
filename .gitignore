@@ -1,0 +1,10 @@
+build/
+*.o
+*.a
+*.so
+.vscode/
+.idea/
+CMakeFiles/
+cmake-build-*/
+*.S.bak
+*.tmp.S
