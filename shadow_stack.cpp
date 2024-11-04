@@ -1,0 +1,128 @@
+#include "shadow_stack.hpp"
+#include <iostream>
+#include <cstring>
+#include <sys/mman.h>
+#include <libunwind.h>
+#include <cxxabi.h>
+#include <sstream>
+#include <iomanip>
+#include <dlfcn.h>
+
+extern "C" {
+    extern void nwind_ret_trampoline();
+    
+    uintptr_t nwind_on_ret_trampoline(uintptr_t stack_pointer) {
+        return ShadowStack::get().on_ret_trampoline(stack_pointer);
+    }
+}
+
+thread_local std::unique_ptr<ShadowStack> ShadowStack::instance;
+
+ShadowStack& ShadowStack::get() {
+    if (!instance) {
+        instance = std::unique_ptr<ShadowStack>(new ShadowStack());
+    }
+    return *instance;
+}
+
+// Helper function to demangle C++ names
+static std::string demangle(const char* symbol) {
+    int status;
+    char* demangled = abi::__cxa_demangle(symbol, nullptr, nullptr, &status);
+    if (status == 0 && demangled) {
+        std::string result(demangled);
+        free(demangled);
+        return result;
+    }
+    return symbol;
+}
+
+
+// Helper function to symbolize an address
+std::string symbolize_address(unw_word_t addr) {
+    unw_context_t context;
+    unw_cursor_t cursor;
+    char sym[256];
+    unw_word_t offset;
+    std::ostringstream result;
+
+    // Create a new context and cursor for the process
+    unw_getcontext(&context);
+    unw_init_local(&cursor, &context);
+
+    // Set the IP in the cursor to our target address
+    unw_set_reg(&cursor, UNW_REG_IP, addr);
+
+    // Now get the proc name for this IP
+    if (unw_get_proc_name(&cursor, sym, sizeof(sym), &offset) == 0) {
+        result << std::hex << "0x" << addr 
+               << " <" << demangle(sym) 
+               << "+0x" << offset << ">";
+    } else {
+        result << std::hex << "0x" << addr << " <unknown>";
+    }
+    
+    return result.str();
+}
+
+uintptr_t ShadowStack::on_ret_trampoline(uintptr_t stack_pointer) {
+    if (entries.empty()) {
+        std::cerr << "Shadow stack underflow!" << std::endl;
+        std::abort();
+    }
+
+    auto& entry = entries.front();  // Use front instead of back
+    if (entry.stack_pointer != stack_pointer) {
+        std::cerr << "Stack pointer mismatch! Expected: " << std::hex 
+                  << entry.stack_pointer << " Got: " << stack_pointer << std::endl;
+        // std::abort();
+    }
+
+    // Restore original return address
+    auto ret_addr = entry.return_address;
+    *(entry.location) = ret_addr;
+
+      // Print symbolized return address
+    std::cout << "Returning to: " << symbolize_address(ret_addr) << std::endl;
+
+    entries.erase(entries.begin());  // Remove from front instead of pop_back
+    return ret_addr;
+}
+
+void ShadowStack::capture_stack_trace() {
+    // Get current frame pointer
+    uintptr_t* bp;
+    asm("mov %%rbp, %0" : "=r"(bp));
+    
+    while (bp) {
+        uintptr_t* ret_addr_loc = bp + 1;  // Return address is stored above frame pointer
+        uintptr_t ret_addr = *ret_addr_loc;
+        
+        if (ret_addr == 0) break;
+
+        // Store entry and inject trampoline
+        entries.push_back({
+            ret_addr,                    // Original return address
+            ret_addr_loc,                // Location on stack
+            (uintptr_t)(bp + 2)         // Stack pointer after return (skip saved rbp and return address)
+        });
+
+        // Make the page containing the return address writable
+        uintptr_t page_start = (uintptr_t)ret_addr_loc & ~(0xFFF);
+        mprotect((void*)page_start, 0x1000, PROT_READ | PROT_WRITE);
+        
+        // Inject trampoline
+        *ret_addr_loc = (uintptr_t)nwind_ret_trampoline;
+        
+        // Move to previous frame
+        bp = (uintptr_t*)*bp;
+    }
+}
+
+void ShadowStack::reset() {
+    // Restore all original return addresses
+    for (auto& entry : entries) {
+        *(entry.location) = entry.return_address;
+    }
+    entries.clear();
+}
