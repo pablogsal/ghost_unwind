@@ -1,6 +1,6 @@
 # Shadow Stack Implementation
 
-A fast stack unwinding implementation using shadow stacks, inspired by the Bytehound profiler technique.
+A fast stack unwinding implementation using shadow stacks
 
 ## Overview
 
