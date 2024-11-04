@@ -16,6 +16,7 @@ public:
     static ShadowStack& get();
     uintptr_t on_ret_trampoline(uintptr_t stack_pointer);
     void capture_stack_trace();
+    const std::vector<uintptr_t> unwind();
     void reset();
 
 private:

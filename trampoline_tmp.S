@@ -3,10 +3,13 @@
 	.globl	nwind_ret_trampoline
 	.type	nwind_ret_trampoline, @function
 nwind_ret_trampoline:
-	movl	$0, %edi
+	movq	%rbp, %rax
+	movq	%rax, -24(%rbp)
+	movq	-24(%rbp), %rax
+	movq	%rax, %rdi
 	call	nwind_on_ret_trampoline@PLT
-	movq	%rax, -8(%rbp)
-	movq	-8(%rbp), %rax
+	movq	%rax, %rbx
+	movq	%rbx, %rax
 	call	*%rax
 	nop
 	ud2

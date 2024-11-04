@@ -75,6 +75,7 @@ uintptr_t ShadowStack::on_ret_trampoline(uintptr_t stack_pointer) {
     if (entry.stack_pointer != stack_pointer) {
         std::cerr << "Stack pointer mismatch! Expected: " << std::hex 
                   << entry.stack_pointer << " Got: " << stack_pointer << std::endl;
+        std::cerr << "Stack pointer diff:" << stack_pointer - entry.stack_pointer << std::endl;
         // std::abort();
     }
 
@@ -90,33 +91,70 @@ uintptr_t ShadowStack::on_ret_trampoline(uintptr_t stack_pointer) {
 }
 
 void ShadowStack::capture_stack_trace() {
-    // Get current frame pointer
-    uintptr_t* bp;
-    asm("mov %%rbp, %0" : "=r"(bp));
+    unw_context_t context;
+    unw_cursor_t cursor;
+    unw_getcontext(&context);
+    unw_init_local(&cursor, &context);
+
+    // Skip first frame (capture_stack_trace)
+    unw_step(&cursor);
     
-    while (bp) {
-        uintptr_t* ret_addr_loc = bp + 1;  // Return address is stored above frame pointer
-        uintptr_t ret_addr = *ret_addr_loc;
+    while (unw_step(&cursor) > 0) {
+        unw_word_t ip, bp;
+        unw_get_reg(&cursor, UNW_REG_IP, &ip);
+        unw_get_reg(&cursor, UNW_X86_64_RBP, &bp);
+
+        if (bp == 0) {
+            break;
+        }
         
-        if (ret_addr == 0) break;
+        // Return address is at bp+8
+        uintptr_t* ret_addr_loc = (uintptr_t*)(bp + 8);
+        uintptr_t ret_addr = *ret_addr_loc;
 
-        // Store entry and inject trampoline
-        entries.push_back({
-            ret_addr,                    // Original return address
-            ret_addr_loc,                // Location on stack
-            (uintptr_t)(bp + 2)         // Stack pointer after return (skip saved rbp and return address)
-        });
+        // If we find a trampoline, we're done
+        if (ret_addr == (uintptr_t)nwind_ret_trampoline) {
+            std::cout << "Found already patched frame, stopping capture\n";
+            break;
+        }
 
+        std::cout << "Capturing frame: " << symbolize_address(ret_addr) << std::endl;
+        
         // Make the page containing the return address writable
         uintptr_t page_start = (uintptr_t)ret_addr_loc & ~(0xFFF);
         mprotect((void*)page_start, 0x1000, PROT_READ | PROT_WRITE);
         
-        // Inject trampoline
-        *ret_addr_loc = (uintptr_t)nwind_ret_trampoline;
+        // Store entry and inject trampoline
+        entries.push_back({
+            ret_addr,
+            ret_addr_loc,
+            (uintptr_t)ret_addr_loc + 8
+        });
         
-        // Move to previous frame
-        bp = (uintptr_t*)*bp;
+        *ret_addr_loc = (uintptr_t)nwind_ret_trampoline;
     }
+}
+
+
+
+// New function to get current stack trace using shadow stack
+const std::vector<uintptr_t> ShadowStack::unwind() {
+    // First ensure all frames are patched
+    capture_stack_trace();
+    
+    // Create vector of return addresses in correct order
+    std::vector<uintptr_t> stack_trace;
+    for (const auto& entry : entries) {
+        stack_trace.push_back(entry.return_address);
+    }
+    
+    // Print the trace
+    std::cout << "\nStack trace:\n";
+    for (size_t i = 0; i < entries.size(); i++) {
+        std::cout << "#" << i << " " << symbolize_address(stack_trace[i]) << std::endl;
+    }
+    
+    return stack_trace;
 }
 
 void ShadowStack::reset() {

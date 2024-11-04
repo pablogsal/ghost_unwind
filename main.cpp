@@ -4,8 +4,10 @@
 __attribute__((noinline))
 void function3() {
     std::cout << "In function3, capturing stack trace..." << std::endl;
-    ShadowStack::get().capture_stack_trace();
-    std::cout << "Stack trace captured, returning..." << std::endl;
+    ShadowStack::get().unwind();
+    std::cout << "Stack trace captured..." << std::endl;
+    ShadowStack::get().unwind();
+    std::cout << "Second Stack trace captured..." << std::endl;
 }
 
 __attribute__((noinline))
