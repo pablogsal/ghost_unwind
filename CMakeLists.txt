@@ -43,3 +43,36 @@ add_executable(shadow_stack_test
 target_link_libraries(shadow_stack_test PRIVATE
     shadow_stack
 )
+
+set(CMAKE_BUILD_TYPE Debug)
+add_compile_options(-g -O0 -fno-omit-frame-pointer)
+add_compile_options(-Wall -Wextra -Wpedantic)
+add_compile_options(-DDEBUG)
+
+# Create preload library
+add_library(read_tracer SHARED
+    src/preload.cpp
+    src/shadow_stack.cpp
+    ${CMAKE_BINARY_DIR}/trampoline.o
+)
+
+target_include_directories(read_tracer PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_link_libraries(read_tracer PUBLIC
+    unwind
+    dl
+    pthread
+)
+
+set_target_properties(read_tracer PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# Create test program
+add_executable(test_read
+    test/test_read.cpp
+)

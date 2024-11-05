@@ -22,5 +22,6 @@ public:
 private:
     ShadowStack() = default;
     std::vector<StackEntry> entries;
+    size_t location = 0;
     static thread_local std::unique_ptr<ShadowStack> instance;
 };

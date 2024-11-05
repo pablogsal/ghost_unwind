@@ -14,6 +14,12 @@ extern "C" {
     uintptr_t nwind_on_ret_trampoline(uintptr_t stack_pointer) {
         return ShadowStack::get().on_ret_trampoline(stack_pointer);
     }
+
+    
+    uintptr_t nwind_on_exception_through_trampoline(uintptr_t stack_pointer) {
+        printf("Oh no!\n");
+        return 0;
+    }
 }
 
 thread_local std::unique_ptr<ShadowStack> ShadowStack::instance;
@@ -71,26 +77,35 @@ uintptr_t ShadowStack::on_ret_trampoline(uintptr_t stack_pointer) {
         std::abort();
     }
 
-    auto& entry = entries.front();  // Use front instead of back
+    auto& entry = entries[location++];
     if (entry.stack_pointer != stack_pointer) {
         std::cerr << "Stack pointer mismatch! Expected: " << std::hex 
                   << entry.stack_pointer << " Got: " << stack_pointer << std::endl;
         std::cerr << "Stack pointer diff:" << stack_pointer - entry.stack_pointer << std::endl;
         // std::abort();
     }
+    if (entry.return_address == (uintptr_t)nwind_ret_trampoline) {
+        std::cerr << "Already patched frame!" << std::endl;
+        std::abort();
+    }
+    std::cerr << "Returning to:" << (void*)entry.return_address << std::endl;
 
     // Restore original return address
     auto ret_addr = entry.return_address;
-    *(entry.location) = ret_addr;
+    // *(entry.location) = ret_addr;
 
       // Print symbolized return address
-    std::cout << "Returning to: " << symbolize_address(ret_addr) << std::endl;
+    // std::cout << "Returning to: " << symbolize_address(ret_addr) << std::endl;
 
-    entries.erase(entries.begin());  // Remove from front instead of pop_back
     return ret_addr;
 }
 
 void ShadowStack::capture_stack_trace() {
+    // if (entries.size() > 0) {
+    //     return;
+    // }
+    std::vector<StackEntry> new_entries;
+    bool found_existing_frame = false;
     unw_context_t context;
     unw_cursor_t cursor;
     unw_getcontext(&context);
@@ -98,41 +113,66 @@ void ShadowStack::capture_stack_trace() {
 
     // Skip first frame (capture_stack_trace)
     unw_step(&cursor);
+
+    uintptr_t* ret_addr_loc = 0;
     
     while (unw_step(&cursor) > 0) {
         unw_word_t ip, bp;
         unw_get_reg(&cursor, UNW_REG_IP, &ip);
         unw_get_reg(&cursor, UNW_X86_64_RBP, &bp);
 
-        if (bp == 0) {
+        if (ret_addr_loc) {
+            uintptr_t ret_addr = *ret_addr_loc;
+            // If we find a trampoline, we're done
+            if (ret_addr == (uintptr_t)nwind_ret_trampoline) {
+                found_existing_frame = true;
+                std::cout << "Found already patched frame, stopping capture\n";
+                break;
+            }
+            // std::cout << "Capturing frame: " << symbolize_address(ret_addr) << std::endl;
+            printf("Address pushed to stack: %p\n", ret_addr);
+            
+            // Make the page containing the return address writable
+            uintptr_t page_start = (uintptr_t)ret_addr_loc & ~(0xFFF);
+            mprotect((void*)page_start, 0x1000, PROT_READ | PROT_WRITE);
+            
+            // Store entry and inject trampoline
+            new_entries.push_back({
+                ret_addr,
+                ret_addr_loc,
+                (uintptr_t)ret_addr_loc + 8
+            });
+            
+            // *ret_addr_loc = (uintptr_t)nwind_ret_trampoline;
+        }
+
+        if (bp < 4098) {
             break;
         }
         
         // Return address is at bp+8
-        uintptr_t* ret_addr_loc = (uintptr_t*)(bp + 8);
-        uintptr_t ret_addr = *ret_addr_loc;
-
-        // If we find a trampoline, we're done
-        if (ret_addr == (uintptr_t)nwind_ret_trampoline) {
-            std::cout << "Found already patched frame, stopping capture\n";
-            break;
-        }
-
-        std::cout << "Capturing frame: " << symbolize_address(ret_addr) << std::endl;
-        
-        // Make the page containing the return address writable
-        uintptr_t page_start = (uintptr_t)ret_addr_loc & ~(0xFFF);
-        mprotect((void*)page_start, 0x1000, PROT_READ | PROT_WRITE);
-        
-        // Store entry and inject trampoline
-        entries.push_back({
-            ret_addr,
-            ret_addr_loc,
-            (uintptr_t)ret_addr_loc + 8
-        });
-        
-        *ret_addr_loc = (uintptr_t)nwind_ret_trampoline;
+        ret_addr_loc = (uintptr_t*)(bp + 8);
     }
+
+    // If we found an existing frame, we need to merge
+    if (found_existing_frame) {
+        // Take new entries and append remaining old entries
+        size_t remaining = entries.size() - location;
+        new_entries.insert(
+            new_entries.end(),
+            entries.begin() + location,
+            entries.end()
+        );
+    }
+
+    // Install trampolines for new entries
+    for (const auto& entry : new_entries) {
+        *entry.location = (uintptr_t)nwind_ret_trampoline;
+    }
+
+    // Replace entries with new configuration
+    entries = std::move(new_entries);
+    location = 0;
 }
 
 
@@ -149,10 +189,10 @@ const std::vector<uintptr_t> ShadowStack::unwind() {
     }
     
     // Print the trace
-    std::cout << "\nStack trace:\n";
-    for (size_t i = 0; i < entries.size(); i++) {
-        std::cout << "#" << i << " " << symbolize_address(stack_trace[i]) << std::endl;
-    }
+    // std::cout << "\nStack trace: "<< entries.size() << "\n";
+    // for (size_t i = 0; i < entries.size(); i++) {
+        // std::cout << "#" << i << " " << (stack_trace[i]) << std::endl;
+    // }
     
     return stack_trace;
 }
