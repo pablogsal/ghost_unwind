@@ -1,18 +1,29 @@
-#include "shadow_stack.hpp"
 #include <algorithm>
 #include <chrono>
+#include <fcntl.h>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <unistd.h>
 #include <vector>
 
-__attribute__((noinline)) int recursive_function(int depth) {
+void read_file() {
+  char buf[100];
+  int fd = open("/etc/hostname", O_RDONLY);
+  if (fd != -1) {
+    read(fd, buf, sizeof(buf));
+    close(fd);
+  }
+}
+
+__attribute__((noinline, optimize("no-optimize-sibling-calls"))) int
+recursive_function(int depth) {
   if (depth == 0) {
     std::cout << "Reached max depth, capturing stack trace..." << std::endl;
 
     // First unwinding
     auto start = std::chrono::steady_clock::now();
-    ShadowStack::get().unwind();
+    read_file();
     auto end = std::chrono::steady_clock::now();
     auto first_unwind_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
@@ -27,13 +38,13 @@ __attribute__((noinline)) int recursive_function(int depth) {
 
     // Warm-up run
     for (int i = 0; i < 100; i++) {
-      ShadowStack::get().unwind();
+      read_file();
     }
 
     // Actual timing
     for (int i = 0; i < N; i++) {
       start = std::chrono::steady_clock::now();
-      ShadowStack::get().unwind();
+      read_file();
       end = std::chrono::steady_clock::now();
       double duration_us =
           std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
@@ -72,7 +83,7 @@ __attribute__((noinline)) int recursive_function(int depth) {
 }
 
 int main() {
-  const int RECURSION_DEPTH = 100;
+  const int RECURSION_DEPTH = 1000;
   std::cout << "Starting recursive calls with depth " << RECURSION_DEPTH
             << std::endl;
 

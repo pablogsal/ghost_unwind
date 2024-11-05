@@ -76,6 +76,7 @@ uintptr_t ShadowStack::on_ret_trampoline(uintptr_t stack_pointer) {
 
   if (location >= entries.size()) {
     std::cerr << "Shadow stack overflow!" << std::endl;
+    std::cerr << location << " > " << entries.size() << std::endl;
     std::abort();
   }
 
@@ -111,33 +112,27 @@ void ShadowStack::capture_stack_trace(bool install_trampolines) {
   unw_getcontext(&context);
   unw_init_local(&cursor, &context);
 
-  // Skip first frame (capture_stack_trace)
-  unw_step(&cursor);
+  // Skip first two frames (capture_stack_trace and its caller)
+  unw_step(&cursor); // Skip our frame
+  unw_step(&cursor); // Skip caller's frame
 
-  // Process each frame
+  uintptr_t *ret_addr_loc = nullptr;
+
   while (unw_step(&cursor) > 0) {
     unw_word_t ip, bp, sp;
     unw_get_reg(&cursor, UNW_REG_IP, &ip);
     unw_get_reg(&cursor, UNW_X86_64_RBP, &bp);
     unw_get_reg(&cursor, UNW_REG_SP, &sp);
 
-    // Break if we hit the stack boundary
-    if (bp < 4098) {
-      break;
-    }
-
-    // Calculate return address location for current frame
-    uintptr_t *ret_addr_loc = (uintptr_t *)(sp - sizeof(void *));
-
-    // Skip if return address location is invalid
+    // Now sp-8 points to the return address location we actually want to patch
+    ret_addr_loc = (uintptr_t *)(sp - sizeof(void *));
     if (!ret_addr_loc) {
       continue;
     }
 
-    // Read the return address
     uintptr_t ret_addr = *ret_addr_loc;
 
-    // Check if we've hit an existing trampoline
+    // Check for existing trampoline
     if (ret_addr == (uintptr_t)nwind_ret_trampoline) {
       found_existing_frame = true;
       std::cout << "Found already patched frame, stopping capture\n";
@@ -153,13 +148,12 @@ void ShadowStack::capture_stack_trace(bool install_trampolines) {
         {ret_addr, ret_addr_loc, (uintptr_t)ret_addr_loc + 8});
   }
 
-  // Merge with existing entries if we found an existing frame
+  // Handle merging if we found existing frame
   if (found_existing_frame && !entries.empty()) {
     size_t total = entries.size() + new_entries.size();
     std::cerr << "Using " << (entries.size() * 100.0f / total)
               << "% of existing frames" << std::endl;
 
-    // Append remaining old entries
     new_entries.insert(new_entries.end(), entries.begin() + location,
                        entries.end());
   }
@@ -173,7 +167,6 @@ void ShadowStack::capture_stack_trace(bool install_trampolines) {
     }
   }
 
-  // Update entries
   entries = std::move(new_entries);
   location = 0;
 }

@@ -9,6 +9,7 @@ struct StackEntry {
   uintptr_t return_address; // Original return address
   uintptr_t *location;      // Location of return address on stack
   uintptr_t stack_pointer;  // Stack pointer value
+  uintptr_t ip;             // Instruction pointer when the trace was taken
 };
 
 class ShadowStack {
