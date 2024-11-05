@@ -15,9 +15,12 @@ uintptr_t nwind_on_ret_trampoline(uintptr_t stack_pointer) {
   return ShadowStack::get().on_ret_trampoline(stack_pointer);
 }
 
-uintptr_t nwind_on_exception_through_trampoline(uintptr_t stack_pointer) {
+uintptr_t nwind_on_exception_through_trampoline(void *exception) {
   printf("Oh no!\n");
-  return 0;
+  uintptr_t return_addr = ShadowStack::get().on_ret_trampoline(0);
+  ShadowStack::get().reset();
+  __cxa_begin_catch(exception);
+  return return_addr;
 }
 }
 
@@ -81,7 +84,7 @@ uintptr_t ShadowStack::on_ret_trampoline(uintptr_t stack_pointer) {
   }
 
   auto &entry = entries[location++];
-  if (entry.stack_pointer != stack_pointer) {
+  if (entry.stack_pointer != stack_pointer && stack_pointer != 0) {
     std::cerr << "Stack pointer mismatch! Expected: " << std::hex
               << entry.stack_pointer << " Got: " << stack_pointer << std::endl;
     std::cerr << "Stack pointer diff:" << stack_pointer - entry.stack_pointer
@@ -186,7 +189,8 @@ const std::vector<uintptr_t> ShadowStack::unwind(bool install_trampolines) {
 
 void ShadowStack::reset() {
   // Restore all original return addresses
-  for (auto &entry : entries) {
+  for (size_t i = location; i < entries.size(); i++) {
+    auto &entry = entries[i];
     *(entry.location) = entry.return_address;
   }
   entries.clear();

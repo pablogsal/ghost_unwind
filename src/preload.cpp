@@ -35,7 +35,7 @@ extern "C" ssize_t read(int fd, void *buf, size_t count) {
   }
   in_trampoline = true;
   // Get stack trace before calling read
-  auto trace = ShadowStack::get().unwind(false);
+  auto trace = ShadowStack::get().unwind(true);
 
   // Call real read
   ssize_t result = real_read(fd, buf, count);
