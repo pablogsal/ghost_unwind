@@ -19,7 +19,7 @@ uintptr_t nwind_on_exception_through_trampoline(void *exception) {
   printf("Oh no!\n");
   uintptr_t return_addr = ShadowStack::get().on_ret_trampoline(0);
   ShadowStack::get().reset();
-  __cxa_begin_catch(exception);
+  __cxxabiv1::__cxa_begin_catch(exception);
   return return_addr;
 }
 }
@@ -100,7 +100,7 @@ uintptr_t ShadowStack::on_ret_trampoline(uintptr_t stack_pointer) {
   auto ret_addr = entry.return_address;
 
   // Print symbolized return address
-  // std::cout << "Returning to: " << symbolize_address(ret_addr) << std::endl;
+  std::cout << "Returning to: " << symbolize_address(ret_addr) << std::endl;
 
   return ret_addr;
 }
@@ -122,10 +122,17 @@ void ShadowStack::capture_stack_trace(bool install_trampolines) {
   uintptr_t *ret_addr_loc = nullptr;
 
   while (unw_step(&cursor) > 0) {
-    unw_word_t ip, bp, sp;
+    unw_word_t ip, bp, sp, lr;
     unw_get_reg(&cursor, UNW_REG_IP, &ip);
     unw_get_reg(&cursor, UNW_X86_64_RBP, &bp);
     unw_get_reg(&cursor, UNW_REG_SP, &sp);
+    unw_get_reg(&cursor, UNW_REG_SP, &lr);
+    printf("%p\n", nwind_ret_trampoline);
+
+     unw_proc_info_t frameInfo;
+    unw_get_proc_info(&cursor, &frameInfo);
+  std::cout << "STACK is : " << symbolize_address(ip) << std::endl;
+  std::cout << "Handler is: " << frameInfo.handler << std::endl;
 
     // Now sp-8 points to the return address location we actually want to patch
     ret_addr_loc = (uintptr_t *)(sp - sizeof(void *));
@@ -165,6 +172,7 @@ void ShadowStack::capture_stack_trace(bool install_trampolines) {
 
   // Install trampolines for new entries
   if (install_trampolines) {
+    std::cerr << "Installing trampolinges" << std::endl;
     for (const auto &entry : new_entries) {
       *entry.location = (uintptr_t)nwind_ret_trampoline;
     }
@@ -181,6 +189,7 @@ const std::vector<uintptr_t> ShadowStack::unwind(bool install_trampolines) {
   // Create vector of return addresses in correct order
   std::vector<uintptr_t> stack_trace;
   for (const auto &entry : entries) {
+  std::cout << "STACK : " << symbolize_address(entry.return_address) << std::endl;
     stack_trace.push_back(entry.return_address);
   }
 
