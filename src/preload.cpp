@@ -1,5 +1,5 @@
 #define _GNU_SOURCE
-#include "shadow_stack.hpp"
+#include "ghost_stack.hpp"
 #include <ctime>
 #include <dlfcn.h>
 #include <iomanip>
@@ -35,7 +35,7 @@ extern "C" ssize_t read(int fd, void *buf, size_t count) {
   }
   in_trampoline = true;
   // Get stack trace before calling read
-  auto trace = ShadowStack::get().unwind(true);
+  auto trace = GhostStack::get().unwind(true);
 
   // Call real read
   ssize_t result = real_read(fd, buf, count);

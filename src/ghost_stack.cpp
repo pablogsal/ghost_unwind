@@ -1,4 +1,4 @@
-#include "shadow_stack.hpp"
+#include "ghost_stack.hpp"
 #include <cstring>
 #include <cxxabi.h>
 #include <dlfcn.h>
@@ -12,23 +12,23 @@ extern "C" {
 extern void nwind_ret_trampoline();
 
 uintptr_t nwind_on_ret_trampoline(uintptr_t stack_pointer) {
-  return ShadowStack::get().on_ret_trampoline(stack_pointer);
+  return GhostStack::get().on_ret_trampoline(stack_pointer);
 }
 
 uintptr_t nwind_on_exception_through_trampoline(void *exception) {
   printf("Oh no!\n");
-  uintptr_t return_addr = ShadowStack::get().on_ret_trampoline(0);
-  ShadowStack::get().reset();
+  uintptr_t return_addr = GhostStack::get().on_ret_trampoline(0);
+  GhostStack::get().reset();
   __cxxabiv1::__cxa_begin_catch(exception);
   return return_addr;
 }
 }
 
-thread_local std::unique_ptr<ShadowStack> ShadowStack::instance;
+thread_local std::unique_ptr<GhostStack> GhostStack::instance;
 
-ShadowStack &ShadowStack::get() {
+GhostStack &GhostStack::get() {
   if (!instance) {
-    instance = std::unique_ptr<ShadowStack>(new ShadowStack());
+    instance = std::unique_ptr<GhostStack>(new GhostStack());
   }
   return *instance;
 }
@@ -71,14 +71,14 @@ std::string symbolize_address(unw_word_t addr) {
   return result.str();
 }
 
-uintptr_t ShadowStack::on_ret_trampoline(uintptr_t stack_pointer) {
+uintptr_t GhostStack::on_ret_trampoline(uintptr_t stack_pointer) {
   if (entries.empty()) {
-    std::cerr << "Shadow stack underflow!" << std::endl;
+    std::cerr << "Ghost stack underflow!" << std::endl;
     std::abort();
   }
 
   if (location >= entries.size()) {
-    std::cerr << "Shadow stack overflow!" << std::endl;
+    std::cerr << "Ghost stack overflow!" << std::endl;
     std::cerr << location << " > " << entries.size() << std::endl;
     std::abort();
   }
@@ -105,7 +105,7 @@ uintptr_t ShadowStack::on_ret_trampoline(uintptr_t stack_pointer) {
   return ret_addr;
 }
 
-void ShadowStack::capture_stack_trace(bool install_trampolines) {
+void GhostStack::capture_stack_trace(bool install_trampolines) {
   std::vector<StackEntry> new_entries;
   bool found_existing_frame = false;
 
@@ -181,8 +181,8 @@ void ShadowStack::capture_stack_trace(bool install_trampolines) {
   entries = std::move(new_entries);
   location = 0;
 }
-// New function to get current stack trace using shadow stack
-const std::vector<uintptr_t> ShadowStack::unwind(bool install_trampolines) {
+// New function to get current stack trace using ghost stack
+const std::vector<uintptr_t> GhostStack::unwind(bool install_trampolines) {
   // First ensure all frames are patched
   capture_stack_trace(install_trampolines);
 
@@ -196,7 +196,7 @@ const std::vector<uintptr_t> ShadowStack::unwind(bool install_trampolines) {
   return stack_trace;
 }
 
-void ShadowStack::reset() {
+void GhostStack::reset() {
   // Restore all original return addresses
   for (size_t i = location; i < entries.size(); i++) {
     auto &entry = entries[i];

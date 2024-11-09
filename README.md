@@ -2,7 +2,7 @@
 <img src="images/logo.png" width=50%">
 </p>
 
-# Shadow Stack Implementation
+# Ghost Stack Implementation
 
 A fast stack unwinding implementation using shadow stacks
 
@@ -30,17 +30,17 @@ make
 ## Usage
 
 ```cpp
-#include <shadow_stack.hpp>
+#include <ghost_stack.hpp>
 
 void print_stack_trace() {
-    auto trace = ShadowStack::get().unwind();
+    auto trace = GhostStack::get().unwind();
     // Process trace...
 }
 ```
 
 ## How it Works
 
-The shadow stack implementation:
+The ghost stack implementation:
 1. Uses libunwind to walk the stack initially
 2. Patches return addresses with a trampoline function
 3. Stores original return addresses in a shadow stack

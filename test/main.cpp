@@ -1,14 +1,14 @@
-#include "shadow_stack.hpp"
+#include "ghost_stack.hpp"
 #include <exception>
 #include <iostream>
 
 __attribute__((noinline)) int function3() {
   std::cout << "In function3, capturing stack trace..." << std::endl;
-  ShadowStack::get().unwind(true);
+  GhostStack::get().unwind(true);
   // std::cout << "Stack trace captured..." << std::endl;
   const auto &ex = std::exception();
   // std::cerr << "Exception addr: " << (const void *)&ex << std::endl;
-  ShadowStack::get().unwind();
+  GhostStack::get().unwind();
   throw ex;
   // std::cout << "Second Stack trace captured..." << std::endl;
   return 42;

@@ -10,4 +10,4 @@ cmake ..
 make
 
 # Run tests
-./shadow_stack_test
+./ghost_stack_test

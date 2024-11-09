@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(ShadowStack VERSION 1.0)
+project(GhostStack VERSION 1.0)
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
@@ -21,27 +21,27 @@ add_custom_command(
     DEPENDS ${CMAKE_SOURCE_DIR}/src/aarch64_trampoline.s
 )
 
-# Create shadow stack library
-add_library(shadow_stack
-    src/shadow_stack.cpp
+# Create ghost stack library
+add_library(ghost_stack
+    src/ghost_stack.cpp
     ${CMAKE_BINARY_DIR}/trampoline.o
 )
 
-target_include_directories(shadow_stack PUBLIC
+target_include_directories(ghost_stack PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# target_link_libraries(shadow_stack PUBLIC
+# target_link_libraries(ghost_stack PUBLIC
     # unwind
 # )
 
 # Create test executable
-add_executable(shadow_stack_test
+add_executable(ghost_stack_test
     test/main.cpp
 )
 
-target_link_libraries(shadow_stack_test PRIVATE
-    shadow_stack
+target_link_libraries(ghost_stack_test PRIVATE
+    ghost_stack
 )
 
 set(CMAKE_BUILD_TYPE Debug)
@@ -53,7 +53,7 @@ add_compile_options(-msign-return-address=none)
 # Create preload library
 add_library(read_tracer SHARED
     src/preload.cpp
-    src/shadow_stack.cpp
+    src/ghost_stack.cpp
     ${CMAKE_BINARY_DIR}/trampoline.o
 )
 

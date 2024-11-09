@@ -12,17 +12,17 @@ struct StackEntry {
   uintptr_t ip;             // Instruction pointer when the trace was taken
 };
 
-class ShadowStack {
+class GhostStack {
 public:
-  static ShadowStack &get();
+  static GhostStack &get();
   uintptr_t on_ret_trampoline(uintptr_t stack_pointer);
   void capture_stack_trace(bool install_trampolines);
   const std::vector<uintptr_t> unwind(bool install_trampolines = true);
   void reset();
 
 private:
-  ShadowStack() = default;
+  GhostStack() = default;
   std::vector<StackEntry> entries;
   size_t location = 0;
-  static thread_local std::unique_ptr<ShadowStack> instance;
+  static thread_local std::unique_ptr<GhostStack> instance;
 };

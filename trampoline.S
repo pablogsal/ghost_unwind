@@ -21,13 +21,13 @@ nwind_ret_trampoline:
     sub rsp, 8
 
     # Set up the argument for our handler function. The handler needs the original
-    # stack pointer (before our pushes) to find the right shadow stack entry.
+    # stack pointer (before our pushes) to find the right ghost stack entry.
     # RDI is the first argument register in the AMD64 ABI.
     mov rdi, rsp
     add rdi, 32     # Add back the size of our pushes (24 bytes) plus alignment (8 bytes)
 
     # Call our handler to get the original return address. The handler will
-    # look up the return address in the shadow stack based on the stack pointer
+    # look up the return address in the ghost stack based on the stack pointer
     # we passed.
     call nwind_on_ret_trampoline
 
