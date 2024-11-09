@@ -1,3 +1,7 @@
+<p align="center">
+<img src="images/logo.png" width=50%">
+</p>
+
 # Shadow Stack Implementation
 
 A fast stack unwinding implementation using shadow stacks
