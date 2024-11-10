@@ -26,10 +26,14 @@ __attribute__((constructor)) static void init() {
     std::cerr << "Failed to get real read function: " << dlerror() << std::endl;
     abort();
   }
+
 }
 
 // Our intercepted read function
 extern "C" ssize_t read(int fd, void *buf, size_t count) {
+  if (!real_read) {
+    init();
+  }
   if (in_trampoline) {
     return real_read(fd, buf, count);
   }
@@ -44,13 +48,13 @@ extern "C" ssize_t read(int fd, void *buf, size_t count) {
   pthread_mutex_lock(&print_mutex);
   auto now = std::time(nullptr);
   std::cout << "=== read() call at " << std::ctime(&now);
-  // std::cout << "fd: " << fd << ", count: " << count << ", result: " << result
-  // << std::endl; std::cout << "Stack trace:" << std::endl; std::cout << "-->"
-  // << trace.size() << std::endl; for (size_t i = 0; i < trace.size(); i++) {
-  //     std::cout << "#" << i << " " << std::hex << "0x" << trace[i] <<
-  //     std::dec << std::endl;
-  // }
-  // std::cout << "===" << std::endl;
+  std::cout << "fd: " << fd << ", count: " << count << ", result: " << result
+  << std::endl; std::cout << "Stack trace:" << std::endl; std::cout << "-->"
+  << trace.size() << std::endl; for (size_t i = 0; i < trace.size(); i++) {
+      std::cout << "#" << i << " " << std::hex << "0x" << trace[i] <<
+      std::dec << std::endl;
+  }
+  std::cout << "===" << std::endl;
   pthread_mutex_unlock(&print_mutex);
   in_trampoline = false;
 

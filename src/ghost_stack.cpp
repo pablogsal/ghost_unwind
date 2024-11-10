@@ -4,9 +4,11 @@
 #include <dlfcn.h>
 #include <iomanip>
 #include <iostream>
+#define UNW_LOCAL_ONLY
 #include <libunwind.h>
 #include <sstream>
 #include <sys/mman.h>
+#include <execinfo.h>
 
 extern "C" {
 extern void nwind_ret_trampoline();
@@ -89,14 +91,12 @@ uintptr_t GhostStack::on_ret_trampoline(uintptr_t stack_pointer) {
               << entry.stack_pointer << " Got: " << stack_pointer << std::endl;
     std::cerr << "Stack pointer diff:" << stack_pointer - entry.stack_pointer
               << std::endl;
-    std::abort();
+    // std::abort();
   }
   if (entry.return_address == (uintptr_t)nwind_ret_trampoline) {
     std::cerr << "Already patched frame!" << std::endl;
     std::abort();
   }
-  // std::cerr << "Returning to:" << (void *)entry.return_address << std::endl;
-
   auto ret_addr = entry.return_address;
 
   // Print symbolized return address
@@ -105,6 +105,31 @@ uintptr_t GhostStack::on_ret_trampoline(uintptr_t stack_pointer) {
   return ret_addr;
 }
 
+#include <cstdint>
+
+#if defined(__arm__) || defined(__arm64__) || defined(__aarch64__)
+static inline uint64_t ptrauth_strip(uint64_t __value, unsigned int __key) {
+  // On the stack the link register is protected with Pointer
+  // Authentication Code when compiled with -mbranch-protection.
+  uint64_t ret;
+  asm volatile(
+      "mov x30, %1\n\t"
+      // "hint #7\n\t"  // xpaclri
+      "xpaclri\n\t"
+      "mov %0, x30\n\t"
+      : "=r"(ret)
+      : "r"(__value)
+      : "x30");
+  return ret;
+}
+#else
+static inline uint64_t ptrauth_strip(uint64_t __value, unsigned int __key) {
+  return __value;
+}
+#endif
+
+
+__attribute__((noinline)) 
 void GhostStack::capture_stack_trace(bool install_trampolines) {
   std::vector<StackEntry> new_entries;
   bool found_existing_frame = false;
@@ -115,32 +140,33 @@ void GhostStack::capture_stack_trace(bool install_trampolines) {
   unw_getcontext(&context);
   unw_init_local(&cursor, &context);
 
-  // Skip first two frames (capture_stack_trace and its caller)
-  unw_step(&cursor); // Skip our frame
-  unw_step(&cursor); // Skip caller's frame
+  // Skip first frame (capture_stack_trace)
+  unw_step(&cursor);
+  unw_step(&cursor);
+  unw_word_t ip, fp;
+  unw_get_reg(&cursor, UNW_REG_IP, &ip);
+  unw_get_reg(&cursor, UNW_AARCH64_X29, &fp);
 
-  uintptr_t *ret_addr_loc = nullptr;
+  while (unw_step(&cursor)) {
 
-  while (unw_step(&cursor) > 0) {
-    unw_word_t ip, bp, sp, lr;
-    unw_get_reg(&cursor, UNW_REG_IP, &ip);
-    unw_get_reg(&cursor, UNW_X86_64_RBP, &bp);
-    unw_get_reg(&cursor, UNW_REG_SP, &sp);
-    unw_get_reg(&cursor, UNW_REG_SP, &lr);
-    printf("%p\n", nwind_ret_trampoline);
-
-     unw_proc_info_t frameInfo;
-    unw_get_proc_info(&cursor, &frameInfo);
-  std::cout << "STACK is : " << symbolize_address(ip) << std::endl;
-  std::cout << "Handler is: " << frameInfo.handler << std::endl;
-
-    // Now sp-8 points to the return address location we actually want to patch
-    ret_addr_loc = (uintptr_t *)(sp - sizeof(void *));
-    if (!ret_addr_loc) {
-      continue;
+#ifdef __linux__
+    // Get save location for current frame
+    unw_save_loc_t saveLoc;
+    unw_get_save_loc(&cursor, UNW_AARCH64_X30, &saveLoc);
+    if (saveLoc.type != UNW_SLT_MEMORY) {
+      std::cout << "Warning: Return address not stored in memory at " 
+                << symbolize_address(ip) << std::endl;
+      break;
     }
+    uintptr_t *ret_addr_loc = (uintptr_t*)saveLoc.u.addr;
+#else
+    uintptr_t *ret_addr_loc = (uintptr_t*)(fp + sizeof(void*));
+#endif
 
+    // Now saveLoc points to the return address location for the previous frame
+    printf("Return addr loc is: %p\n", ret_addr_loc);
     uintptr_t ret_addr = *ret_addr_loc;
+    std::cout << "Return addr is: " << symbolize_address(ret_addr) << std::endl;
 
     // Check for existing trampoline
     if (ret_addr == (uintptr_t)nwind_ret_trampoline) {
@@ -153,9 +179,31 @@ void GhostStack::capture_stack_trace(bool install_trampolines) {
     uintptr_t page_start = (uintptr_t)ret_addr_loc & ~(0xFFF);
     mprotect((void *)page_start, 0x1000, PROT_READ | PROT_WRITE);
 
-    // Store the entry
-    new_entries.push_back(
-        {ret_addr, ret_addr_loc, (uintptr_t)ret_addr_loc + 8});
+    ip = ptrauth_strip(ip, 0);
+
+    new_entries.push_back({ret_addr, ret_addr_loc, 0, (uintptr_t)ip});
+
+    // Get current frame's IP for next iteration
+    unw_get_reg(&cursor, UNW_REG_IP, &ip);
+    unw_get_reg(&cursor, UNW_AARCH64_X29, &fp);
+  }
+
+  std::cerr << "Using 100% of " << new_entries.size() << " frames" << std::endl;
+
+  // Install trampolines for new entries
+  if (install_trampolines && new_entries.size()) {
+    // Validate that return addresses match next frame's IP
+    for (size_t i = 0; i < new_entries.size() - 1; i++) {
+      if (new_entries[i].return_address != new_entries[i + 1].ip) {
+        std::cerr << "Stack frame validation failed at frame " << i << "!\n"
+                  << "Return address: " << symbolize_address(new_entries[i].return_address) << "\n"
+                  << "Next frame IP: " << symbolize_address(new_entries[i + 1].ip) << std::endl;
+        return;
+      }
+    }
+    for (const auto &entry : new_entries) {
+      *entry.location = (uintptr_t)nwind_ret_trampoline;
+    }
   }
 
   // Handle merging if we found existing frame
@@ -165,23 +213,16 @@ void GhostStack::capture_stack_trace(bool install_trampolines) {
               << "% of existing frames" << std::endl;
 
     new_entries.insert(new_entries.end(), entries.begin() + location,
-                       entries.end());
+                      entries.end());
   }
 
-  std::cerr << "Using 100% of " << new_entries.size() << " frames" << std::endl;
 
-  // Install trampolines for new entries
-  if (install_trampolines) {
-    std::cerr << "Installing trampolinges" << std::endl;
-    for (const auto &entry : new_entries) {
-      *entry.location = (uintptr_t)nwind_ret_trampoline;
-    }
-  }
 
   entries = std::move(new_entries);
   location = 0;
 }
 // New function to get current stack trace using ghost stack
+__attribute__((noinline)) 
 const std::vector<uintptr_t> GhostStack::unwind(bool install_trampolines) {
   // First ensure all frames are patched
   capture_stack_trace(install_trampolines);
