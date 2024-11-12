@@ -128,6 +128,15 @@ static inline uint64_t ptrauth_strip(uint64_t __value, unsigned int __key) {
 }
 #endif
 
+#if defined(__arm__) || defined(__arm64__) || defined(__aarch64__)
+#define SP_REGISTER UNW_AARCH64_X29
+#define RA_REGISTER UNW_AARCH64_X30
+#elif defined(__x86_64__)
+#define SP_REGISTER UNW_X86_64_RBP
+#define RA_REGISTER UNW_X86_64_RIP
+#else
+#error "Unsupported architecture"
+#endif
 
 __attribute__((noinline)) 
 void GhostStack::capture_stack_trace(bool install_trampolines) {
@@ -145,14 +154,14 @@ void GhostStack::capture_stack_trace(bool install_trampolines) {
   unw_step(&cursor);
   unw_word_t ip, fp;
   unw_get_reg(&cursor, UNW_REG_IP, &ip);
-  unw_get_reg(&cursor, UNW_AARCH64_X29, &fp);
+  unw_get_reg(&cursor, SP_REGISTER, &fp);
 
   while (unw_step(&cursor)) {
 
 #ifdef __linux__
     // Get save location for current frame
     unw_save_loc_t saveLoc;
-    unw_get_save_loc(&cursor, UNW_AARCH64_X30, &saveLoc);
+    unw_get_save_loc(&cursor, RA_REGISTER, &saveLoc);
     if (saveLoc.type != UNW_SLT_MEMORY) {
       std::cout << "Warning: Return address not stored in memory at " 
                 << symbolize_address(ip) << std::endl;
@@ -185,7 +194,7 @@ void GhostStack::capture_stack_trace(bool install_trampolines) {
 
     // Get current frame's IP for next iteration
     unw_get_reg(&cursor, UNW_REG_IP, &ip);
-    unw_get_reg(&cursor, UNW_AARCH64_X29, &fp);
+    unw_get_reg(&cursor, SP_REGISTER, &fp);
   }
 
   std::cerr << "Using 100% of " << new_entries.size() << " frames" << std::endl;

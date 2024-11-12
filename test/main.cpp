@@ -9,7 +9,7 @@ __attribute__((noinline)) int function3() {
   const auto &ex = std::exception();
   // std::cerr << "Exception addr: " << (const void *)&ex << std::endl;
   GhostStack::get().unwind();
-  // throw ex;
+  throw ex;
   // std::cout << "Second Stack trace captured..." << std::endl;
   return 42;
 }
