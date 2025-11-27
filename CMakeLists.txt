@@ -5,6 +5,11 @@ project(GhostStack VERSION 1.0)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Build type
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
 # Detect OS and architecture
 if(APPLE)
     set(OS_NAME "darwin")
@@ -23,6 +28,8 @@ else()
     message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
 
+message(STATUS "Building for ${OS_NAME}-${ARCH_NAME}")
+
 # Set the appropriate assembly file based on OS and architecture
 set(TRAMPOLINE_SOURCE "${CMAKE_SOURCE_DIR}/src/${ARCH_NAME}_${OS_NAME}_trampoline.s")
 
@@ -31,15 +38,30 @@ if(NOT EXISTS ${TRAMPOLINE_SOURCE})
     message(FATAL_ERROR "Missing assembly file for ${ARCH_NAME}-${OS_NAME}: ${TRAMPOLINE_SOURCE}")
 endif()
 
+# Compiler flags
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
+set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -fno-omit-frame-pointer -DDEBUG")
+set(CMAKE_CXX_FLAGS_RELEASE "-O2 -fno-omit-frame-pointer -DNDEBUG")
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -fno-omit-frame-pointer")
+
 # Add trampoline assembly to library
+find_program(AS_EXECUTABLE as)
+if(NOT AS_EXECUTABLE)
+    set(AS_EXECUTABLE "as")
+endif()
+
 add_custom_command(
     OUTPUT ${CMAKE_BINARY_DIR}/trampoline.o
-    COMMAND as ${TRAMPOLINE_SOURCE} -o ${CMAKE_BINARY_DIR}/trampoline.o
+    COMMAND ${AS_EXECUTABLE} ${TRAMPOLINE_SOURCE} -o ${CMAKE_BINARY_DIR}/trampoline.o
     DEPENDS ${TRAMPOLINE_SOURCE}
+    COMMENT "Assembling trampoline for ${ARCH_NAME}-${OS_NAME}"
 )
 
-# Create ghost stack library
-add_library(ghost_stack
+# =============================================================================
+# Core Library
+# =============================================================================
+
+add_library(ghost_stack STATIC
     src/ghost_stack.cpp
     ${CMAKE_BINARY_DIR}/trampoline.o
 )
@@ -48,28 +70,47 @@ target_include_directories(ghost_stack PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# Only link libunwind on Linux
 if(UNIX AND NOT APPLE)
-    target_link_libraries(ghost_stack PUBLIC unwind)
+    target_link_libraries(ghost_stack PUBLIC unwind pthread)
+else()
+    target_link_libraries(ghost_stack PUBLIC pthread)
 endif()
 
-# Create test executable
+# =============================================================================
+# Tests
+# =============================================================================
+
 add_executable(ghost_stack_test
     test/main.cpp
 )
+target_link_libraries(ghost_stack_test PRIVATE ghost_stack dl)
 
-target_link_libraries(ghost_stack_test PRIVATE
-    ghost_stack
+add_executable(ghost_stack_test_comprehensive
+    test/test_comprehensive.cpp
 )
+target_link_libraries(ghost_stack_test_comprehensive PRIVATE ghost_stack dl)
 
-set(CMAKE_BUILD_TYPE Debug)
-add_compile_options(-g -O0 -fno-omit-frame-pointer)
-add_compile_options(-Wall -Wextra -Wpedantic)
-add_compile_options(-DDEBUG)
+add_executable(ghost_stack_test_exceptions
+    test/test_exceptions.cpp
+)
+target_link_libraries(ghost_stack_test_exceptions PRIVATE ghost_stack dl)
 
-# Create preload library
+add_executable(ghost_stack_bench
+    test/bench.cpp
+)
+target_link_libraries(ghost_stack_bench PRIVATE ghost_stack dl)
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(ghost_stack_bench PRIVATE unwind)
+endif()
+
+# =============================================================================
+# Examples
+# =============================================================================
+
+# LD_PRELOAD library for tracing read() calls
 add_library(read_tracer SHARED
-    src/preload.cpp
+    examples/preload.cpp
     src/ghost_stack.cpp
     ${CMAKE_BINARY_DIR}/trampoline.o
 )
@@ -78,27 +119,54 @@ target_include_directories(read_tracer PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-# Conditionally link libraries based on OS
 if(UNIX AND NOT APPLE)
-    target_link_libraries(read_tracer PUBLIC
-        unwind
-        dl
-        pthread
-    )
+    target_link_libraries(read_tracer PUBLIC unwind dl pthread)
 else()
-    target_link_libraries(read_tracer PUBLIC
-        dl
-        pthread
-    )
+    target_link_libraries(read_tracer PUBLIC dl pthread)
 endif()
 
 set_target_properties(read_tracer PROPERTIES
-    CXX_STANDARD 17
-    CXX_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON
 )
 
-# Create test program
+# Test program for read tracer
 add_executable(test_read
     test/test_read.cpp
 )
+
+# =============================================================================
+# Test Target
+# =============================================================================
+
+add_custom_target(check
+    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test
+    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_comprehensive
+    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_exceptions
+    DEPENDS ghost_stack_test ghost_stack_test_comprehensive ghost_stack_test_exceptions
+    COMMENT "Running all tests"
+)
+
+# =============================================================================
+# Install
+# =============================================================================
+
+install(TARGETS ghost_stack
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)
+
+install(FILES include/ghost_stack.h
+    DESTINATION include
+)
+
+# =============================================================================
+# Summary
+# =============================================================================
+
+message(STATUS "")
+message(STATUS "GhostStack Configuration:")
+message(STATUS "  Build type:     ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Architecture:   ${ARCH_NAME}")
+message(STATUS "  OS:             ${OS_NAME}")
+message(STATUS "  C++ Standard:   ${CMAKE_CXX_STANDARD}")
+message(STATUS "")

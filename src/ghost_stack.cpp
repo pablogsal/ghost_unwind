@@ -1,256 +1,349 @@
-#include "ghost_stack.hpp"
+/**
+ * GhostStack Implementation
+ * =========================
+ * Shadow stack-based fast unwinding with O(1) cached captures.
+ */
+
+#include "ghost_stack.h"
+
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cxxabi.h>
-#include <dlfcn.h>
-#include <iomanip>
-#include <iostream>
+#include <mutex>
+#include <vector>
+
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
-#include <sstream>
-#include <sys/mman.h>
-#include <execinfo.h>
+
+// Assembly trampoline (defined in *_trampoline.s)
+extern "C" void nwind_ret_trampoline();
+
+// ============================================================================
+// Platform Configuration
+// ============================================================================
+
+#if defined(__aarch64__) || defined(__arm64__)
+    #define GS_ARCH_AARCH64 1
+    #define GS_SP_REGISTER UNW_AARCH64_X29
+    #define GS_RA_REGISTER UNW_AARCH64_X30
+#elif defined(__x86_64__)
+    #define GS_ARCH_X86_64 1
+    #define GS_SP_REGISTER UNW_X86_64_RBP
+    #define GS_RA_REGISTER UNW_X86_64_RIP
+#else
+    #error "Unsupported architecture"
+#endif
+
+#ifndef GHOST_STACK_MAX_FRAMES
+#define GHOST_STACK_MAX_FRAMES 256
+#endif
+
+// ============================================================================
+// Logging (minimal, stderr only)
+// ============================================================================
+
+#ifdef DEBUG
+#define LOG_DEBUG(...) fprintf(stderr, "[GhostStack] " __VA_ARGS__)
+#else
+#define LOG_DEBUG(...) ((void)0)
+#endif
+
+#define LOG_ERROR(...) fprintf(stderr, "[GhostStack][ERROR] " __VA_ARGS__)
+
+// ============================================================================
+// Utilities
+// ============================================================================
+
+#ifdef GS_ARCH_AARCH64
+static inline uintptr_t ptrauth_strip(uintptr_t val) {
+    uint64_t ret;
+    asm volatile(
+        "mov x30, %1\n\t"
+        "xpaclri\n\t"
+        "mov %0, x30\n\t"
+        : "=r"(ret) : "r"(val) : "x30");
+    return ret;
+}
+#else
+static inline uintptr_t ptrauth_strip(uintptr_t val) { return val; }
+#endif
+
+// ============================================================================
+// Stack Entry
+// ============================================================================
+
+struct StackEntry {
+    uintptr_t return_address;   // Original return address
+    uintptr_t* location;        // Where it lives on the stack
+    uintptr_t stack_pointer;    // SP at capture time (for validation)
+};
+
+// ============================================================================
+// GhostStack Core (thread-local)
+// ============================================================================
+
+class GhostStackImpl {
+public:
+    GhostStackImpl() {
+        entries_.reserve(64);
+    }
+
+    ~GhostStackImpl() {
+        reset();
+    }
+
+    // Set custom unwinder (NULL = use default libunwind)
+    void set_unwinder(ghost_stack_unwinder_t unwinder) {
+        custom_unwinder_ = unwinder;
+    }
+
+    // Main capture function - returns number of frames
+    size_t backtrace(void** buffer, size_t max_frames) {
+        if (is_capturing_) {
+            return 0;  // Recursive call, bail out
+        }
+        is_capturing_ = true;
+
+        size_t result = 0;
+
+        // Fast path: trampolines installed, return cached frames
+        if (trampolines_installed_ && !entries_.empty()) {
+            result = copy_cached_frames(buffer, max_frames);
+            is_capturing_ = false;
+            return result;
+        }
+
+        // Slow path: capture with unwinder and install trampolines
+        result = capture_and_install(buffer, max_frames);
+        is_capturing_ = false;
+        return result;
+    }
+
+    // Reset: restore original return addresses
+    void reset() {
+        if (trampolines_installed_) {
+            for (size_t i = location_; i < entries_.size(); ++i) {
+                *entries_[i].location = entries_[i].return_address;
+            }
+        }
+        entries_.clear();
+        location_ = 0;
+        trampolines_installed_ = false;
+    }
+
+    // Called by trampoline when a function returns
+    uintptr_t on_ret_trampoline(uintptr_t sp) {
+        if (entries_.empty() || location_ >= entries_.size()) {
+            LOG_ERROR("Stack corruption in trampoline!\n");
+            std::abort();
+        }
+
+        auto& entry = entries_[location_++];
+
+        // Sanity check (warning only, doesn't abort)
+        if (sp != 0 && entry.stack_pointer != 0 && entry.stack_pointer != sp) {
+            LOG_DEBUG("SP mismatch: expected 0x%lx, got 0x%lx\n",
+                      entry.stack_pointer, sp);
+        }
+
+        return entry.return_address;
+    }
+
+private:
+    // Copy cached frames to output buffer
+    size_t copy_cached_frames(void** buffer, size_t max_frames) {
+        size_t available = entries_.size() - location_;
+        size_t count = (available < max_frames) ? available : max_frames;
+
+        for (size_t i = 0; i < count; ++i) {
+            buffer[i] = reinterpret_cast<void*>(entries_[location_ + i].return_address);
+        }
+
+        LOG_DEBUG("Fast path: %zu frames\n", count);
+        return count;
+    }
+
+    // Capture frames using unwinder, install trampolines
+    size_t capture_and_install(void** buffer, size_t max_frames) {
+        // First, capture IPs using the unwinder
+        std::vector<void*> raw_frames(max_frames);
+        size_t raw_count = do_unwind(raw_frames.data(), max_frames);
+
+        if (raw_count == 0) {
+            return 0;
+        }
+
+        // Now walk the stack to get return address locations and install trampolines
+        std::vector<StackEntry> new_entries;
+        new_entries.reserve(raw_count);
+        bool found_existing = false;
+
+        unw_context_t ctx;
+        unw_cursor_t cursor;
+        unw_getcontext(&ctx);
+        unw_init_local(&cursor, &ctx);
+
+        // Skip internal frames (this function + backtrace)
+        for (int i = 0; i < 3 && unw_step(&cursor) > 0; ++i) {}
+
+        size_t frame_idx = 0;
+        while (unw_step(&cursor) > 0 && frame_idx < raw_count) {
+            unw_word_t ip, sp;
+            unw_get_reg(&cursor, UNW_REG_IP, &ip);
+            unw_get_reg(&cursor, GS_SP_REGISTER, &sp);
+
+            // Get location where return address is stored
+            uintptr_t* ret_loc = nullptr;
+#ifdef __linux__
+            unw_save_loc_t loc;
+            if (unw_get_save_loc(&cursor, GS_RA_REGISTER, &loc) == 0 &&
+                loc.type == UNW_SLT_MEMORY) {
+                ret_loc = reinterpret_cast<uintptr_t*>(loc.u.addr);
+            }
+#else
+            // macOS: return address is at fp + sizeof(void*)
+            ret_loc = reinterpret_cast<uintptr_t*>(sp + sizeof(void*));
+#endif
+            if (!ret_loc) break;
+
+            uintptr_t ret_addr = *ret_loc;
+
+            // Check if already patched (cache hit)
+            if (ret_addr == reinterpret_cast<uintptr_t>(nwind_ret_trampoline)) {
+                found_existing = true;
+                LOG_DEBUG("Found existing trampoline at frame %zu\n", frame_idx);
+                break;
+            }
+
+            new_entries.push_back({ret_addr, ret_loc, sp});
+            frame_idx++;
+        }
+
+        // Install trampolines on new entries
+        for (auto& e : new_entries) {
+            *e.location = reinterpret_cast<uintptr_t>(nwind_ret_trampoline);
+        }
+
+        // Merge with existing entries if we found a patched frame
+        if (found_existing && !entries_.empty()) {
+            new_entries.insert(new_entries.end(),
+                               entries_.begin() + static_cast<long>(location_),
+                               entries_.end());
+        }
+
+        entries_ = std::move(new_entries);
+        location_ = 0;
+        trampolines_installed_ = true;
+
+        // Copy to output buffer
+        size_t count = (entries_.size() < max_frames) ? entries_.size() : max_frames;
+        for (size_t i = 0; i < count; ++i) {
+            buffer[i] = reinterpret_cast<void*>(entries_[i].return_address);
+        }
+
+        LOG_DEBUG("Captured %zu frames\n", count);
+        return count;
+    }
+
+    // Call the unwinder (custom or default)
+    size_t do_unwind(void** buffer, size_t max_frames) {
+        if (custom_unwinder_) {
+            return custom_unwinder_(buffer, max_frames);
+        }
+        // Default: use libunwind's unw_backtrace
+        int ret = unw_backtrace(buffer, static_cast<int>(max_frames));
+        return (ret > 0) ? static_cast<size_t>(ret) : 0;
+    }
+
+    std::vector<StackEntry> entries_;
+    size_t location_ = 0;
+    bool is_capturing_ = false;
+    bool trampolines_installed_ = false;
+    ghost_stack_unwinder_t custom_unwinder_ = nullptr;
+};
+
+// ============================================================================
+// Thread-Local Instance
+// ============================================================================
+
+static thread_local GhostStackImpl* t_instance = nullptr;
+
+static GhostStackImpl& get_instance() {
+    if (!t_instance) {
+        t_instance = new GhostStackImpl();
+    }
+    return *t_instance;
+}
+
+// ============================================================================
+// Global State
+// ============================================================================
+
+static std::once_flag g_init_flag;
+static ghost_stack_unwinder_t g_custom_unwinder = nullptr;
+
+// ============================================================================
+// C API Implementation
+// ============================================================================
 
 extern "C" {
-extern void nwind_ret_trampoline();
 
-uintptr_t nwind_on_ret_trampoline(uintptr_t stack_pointer) {
-  return GhostStack::get().on_ret_trampoline(stack_pointer);
+void ghost_stack_init(ghost_stack_unwinder_t unwinder) {
+    std::call_once(g_init_flag, [unwinder]() {
+        g_custom_unwinder = unwinder;
+        LOG_DEBUG("Initialized with %s unwinder\n",
+                  unwinder ? "custom" : "default");
+    });
 }
 
-uintptr_t nwind_on_exception_through_trampoline(void *exception) {
-  printf("Oh no!\n");
-  uintptr_t return_addr = GhostStack::get().on_ret_trampoline(0);
-  GhostStack::get().reset();
-  __cxxabiv1::__cxa_begin_catch(exception);
-  return return_addr;
-}
-}
+size_t ghost_stack_backtrace(void** buffer, size_t size) {
+    // Auto-init if needed
+    std::call_once(g_init_flag, []() {
+        g_custom_unwinder = nullptr;
+    });
 
-thread_local std::unique_ptr<GhostStack> GhostStack::instance;
+    auto& impl = get_instance();
 
-GhostStack &GhostStack::get() {
-  if (!instance) {
-    instance = std::unique_ptr<GhostStack>(new GhostStack());
-  }
-  return *instance;
-}
-
-// Helper function to demangle C++ names
-static std::string demangle(const char *symbol) {
-  int status;
-  char *demangled = abi::__cxa_demangle(symbol, nullptr, nullptr, &status);
-  if (status == 0 && demangled) {
-    std::string result(demangled);
-    free(demangled);
-    return result;
-  }
-  return symbol;
-}
-
-// Helper function to symbolize an address
-std::string symbolize_address(unw_word_t addr) {
-  unw_context_t context;
-  unw_cursor_t cursor;
-  char sym[256];
-  unw_word_t offset;
-  std::ostringstream result;
-
-  // Create a new context and cursor for the process
-  unw_getcontext(&context);
-  unw_init_local(&cursor, &context);
-
-  // Set the IP in the cursor to our target address
-  unw_set_reg(&cursor, UNW_REG_IP, addr);
-
-  // Now get the proc name for this IP
-  if (unw_get_proc_name(&cursor, sym, sizeof(sym), &offset) == 0) {
-    result << std::hex << "0x" << addr << " <" << demangle(sym) << "+0x"
-           << offset << ">";
-  } else {
-    result << std::hex << "0x" << addr << " <unknown>";
-  }
-
-  return result.str();
-}
-
-uintptr_t GhostStack::on_ret_trampoline(uintptr_t stack_pointer) {
-  if (entries.empty()) {
-    std::cerr << "Ghost stack underflow!" << std::endl;
-    std::abort();
-  }
-
-  if (location >= entries.size()) {
-    std::cerr << "Ghost stack overflow!" << std::endl;
-    std::cerr << location << " > " << entries.size() << std::endl;
-    std::abort();
-  }
-
-  auto &entry = entries[location++];
-  if (entry.stack_pointer != stack_pointer && stack_pointer != 0) {
-    std::cerr << "Stack pointer mismatch! Expected: " << std::hex
-              << entry.stack_pointer << " Got: " << stack_pointer << std::endl;
-    std::cerr << "Stack pointer diff:" << stack_pointer - entry.stack_pointer
-              << std::endl;
-    // std::abort();
-  }
-  if (entry.return_address == (uintptr_t)nwind_ret_trampoline) {
-    std::cerr << "Already patched frame!" << std::endl;
-    std::abort();
-  }
-  auto ret_addr = entry.return_address;
-
-  // Print symbolized return address
-  std::cout << "Returning to: " << symbolize_address(ret_addr) << std::endl;
-
-  return ret_addr;
-}
-
-#include <cstdint>
-
-#if defined(__arm__) || defined(__arm64__) || defined(__aarch64__)
-static inline uint64_t ptrauth_strip(uint64_t __value, unsigned int __key) {
-  // On the stack the link register is protected with Pointer
-  // Authentication Code when compiled with -mbranch-protection.
-  uint64_t ret;
-  asm volatile(
-      "mov x30, %1\n\t"
-      // "hint #7\n\t"  // xpaclri
-      "xpaclri\n\t"
-      "mov %0, x30\n\t"
-      : "=r"(ret)
-      : "r"(__value)
-      : "x30");
-  return ret;
-}
-#else
-static inline uint64_t ptrauth_strip(uint64_t __value, unsigned int __key) {
-  return __value;
-}
-#endif
-
-#if defined(__arm__) || defined(__arm64__) || defined(__aarch64__)
-#define SP_REGISTER UNW_AARCH64_X29
-#define RA_REGISTER UNW_AARCH64_X30
-#elif defined(__x86_64__)
-#define SP_REGISTER UNW_X86_64_RBP
-#define RA_REGISTER UNW_X86_64_RIP
-#else
-#error "Unsupported architecture"
-#endif
-
-__attribute__((noinline)) 
-void GhostStack::capture_stack_trace(bool install_trampolines) {
-  std::vector<StackEntry> new_entries;
-  bool found_existing_frame = false;
-
-  // Initialize unwinding
-  unw_context_t context;
-  unw_cursor_t cursor;
-  unw_getcontext(&context);
-  unw_init_local(&cursor, &context);
-
-  // Skip first frame (capture_stack_trace)
-  unw_step(&cursor);
-  unw_step(&cursor);
-  unw_word_t ip, fp;
-  unw_get_reg(&cursor, UNW_REG_IP, &ip);
-  unw_get_reg(&cursor, SP_REGISTER, &fp);
-
-  while (unw_step(&cursor)) {
-
-#ifdef __linux__
-    // Get save location for current frame
-    unw_save_loc_t saveLoc;
-    unw_get_save_loc(&cursor, RA_REGISTER, &saveLoc);
-    if (saveLoc.type != UNW_SLT_MEMORY) {
-      std::cout << "Warning: Return address not stored in memory at " 
-                << symbolize_address(ip) << std::endl;
-      break;
-    }
-    uintptr_t *ret_addr_loc = (uintptr_t*)saveLoc.u.addr;
-#else
-    uintptr_t *ret_addr_loc = (uintptr_t*)(fp + sizeof(void*));
-#endif
-
-    // Now saveLoc points to the return address location for the previous frame
-    printf("Return addr loc is: %p\n", ret_addr_loc);
-    uintptr_t ret_addr = *ret_addr_loc;
-    std::cout << "Return addr is: " << symbolize_address(ret_addr) << std::endl;
-
-    // Check for existing trampoline
-    if (ret_addr == (uintptr_t)nwind_ret_trampoline) {
-      found_existing_frame = true;
-      std::cout << "Found already patched frame, stopping capture\n";
-      break;
+    // Apply global unwinder setting if not already set
+    static thread_local bool unwinder_set = false;
+    if (!unwinder_set) {
+        impl.set_unwinder(g_custom_unwinder);
+        unwinder_set = true;
     }
 
-    // Make the page containing the return address writable
-    uintptr_t page_start = (uintptr_t)ret_addr_loc & ~(0xFFF);
-    mprotect((void *)page_start, 0x1000, PROT_READ | PROT_WRITE);
+    return impl.backtrace(buffer, size);
+}
 
-    ip = ptrauth_strip(ip, 0);
-
-    new_entries.push_back({ret_addr, ret_addr_loc, 0, (uintptr_t)ip});
-
-    // Get current frame's IP for next iteration
-    unw_get_reg(&cursor, UNW_REG_IP, &ip);
-    unw_get_reg(&cursor, SP_REGISTER, &fp);
-  }
-
-  std::cerr << "Using 100% of " << new_entries.size() << " frames" << std::endl;
-
-  // Install trampolines for new entries
-  if (install_trampolines && new_entries.size()) {
-    // Validate that return addresses match next frame's IP
-    for (size_t i = 0; i < new_entries.size() - 1; i++) {
-      if (new_entries[i].return_address != new_entries[i + 1].ip) {
-        std::cerr << "Stack frame validation failed at frame " << i << "!\n"
-                  << "Return address: " << symbolize_address(new_entries[i].return_address) << "\n"
-                  << "Next frame IP: " << symbolize_address(new_entries[i + 1].ip) << std::endl;
-        return;
-      }
+void ghost_stack_reset(void) {
+    if (t_instance) {
+        t_instance->reset();
     }
-    for (const auto &entry : new_entries) {
-      *entry.location = (uintptr_t)nwind_ret_trampoline;
+}
+
+void ghost_stack_thread_cleanup(void) {
+    if (t_instance) {
+        delete t_instance;
+        t_instance = nullptr;
     }
-  }
-
-  // Handle merging if we found existing frame
-  if (found_existing_frame && !entries.empty()) {
-    size_t total = entries.size() + new_entries.size();
-    std::cerr << "Using " << (entries.size() * 100.0f / total)
-              << "% of existing frames" << std::endl;
-
-    new_entries.insert(new_entries.end(), entries.begin() + location,
-                      entries.end());
-  }
-
-
-
-  entries = std::move(new_entries);
-  location = 0;
-}
-// New function to get current stack trace using ghost stack
-__attribute__((noinline)) 
-const std::vector<uintptr_t> GhostStack::unwind(bool install_trampolines) {
-  // First ensure all frames are patched
-  capture_stack_trace(install_trampolines);
-
-  // Create vector of return addresses in correct order
-  std::vector<uintptr_t> stack_trace;
-  for (const auto &entry : entries) {
-  std::cout << "STACK : " << symbolize_address(entry.return_address) << std::endl;
-    stack_trace.push_back(entry.return_address);
-  }
-
-  return stack_trace;
 }
 
-void GhostStack::reset() {
-  // Restore all original return addresses
-  for (size_t i = location; i < entries.size(); i++) {
-    auto &entry = entries[i];
-    *(entry.location) = entry.return_address;
-  }
-  entries.clear();
+// Called by assembly trampoline
+uintptr_t nwind_on_ret_trampoline(uintptr_t sp) {
+    return get_instance().on_ret_trampoline(sp);
 }
+
+// Called when exception passes through trampoline
+uintptr_t nwind_on_exception_through_trampoline(void* exception) {
+    LOG_DEBUG("Exception through trampoline\n");
+
+    uintptr_t ret = get_instance().on_ret_trampoline(0);
+    get_instance().reset();
+
+    __cxxabiv1::__cxa_begin_catch(exception);
+    return ret;
+}
+
+} // extern "C"
