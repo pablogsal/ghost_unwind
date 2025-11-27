@@ -18,6 +18,10 @@
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
 
+#ifdef __APPLE__
+#include <execinfo.h>
+#endif
+
 // Assembly trampoline (defined in *_trampoline.s)
 extern "C" void nwind_ret_trampoline();
 
@@ -38,7 +42,7 @@ extern "C" void nwind_ret_trampoline();
 #endif
 
 #ifndef GHOST_STACK_MAX_FRAMES
-#define GHOST_STACK_MAX_FRAMES 256
+#define GHOST_STACK_MAX_FRAMES 512
 #endif
 
 // ============================================================================
@@ -186,8 +190,14 @@ private:
         unw_getcontext(&ctx);
         unw_init_local(&cursor, &ctx);
 
-        // Skip internal frames (this function + backtrace)
+        // Skip internal frames (platform-specific due to backtrace/libunwind differences)
+#ifdef __APPLE__
+        // macOS: Skip fewer frames due to backtrace()/libunwind difference
+        for (int i = 0; i < 1 && unw_step(&cursor) > 0; ++i) {}
+#else
+        // Linux: Skip internal frames (this function + backtrace)
         for (int i = 0; i < 3 && unw_step(&cursor) > 0; ++i) {}
+#endif
 
         size_t frame_idx = 0;
         while (unw_step(&cursor) > 0 && frame_idx < raw_count) {
@@ -253,9 +263,16 @@ private:
         if (custom_unwinder_) {
             return custom_unwinder_(buffer, max_frames);
         }
-        // Default: use libunwind's unw_backtrace
+
+#ifdef __APPLE__
+        // macOS: use standard backtrace function
+        int ret = ::backtrace(buffer, static_cast<int>(max_frames));
+        return (ret > 0) ? static_cast<size_t>(ret) : 0;
+#else
+        // Linux: use libunwind's unw_backtrace
         int ret = unw_backtrace(buffer, static_cast<int>(max_frames));
         return (ret > 0) ? static_cast<size_t>(ret) : 0;
+#endif
     }
 
     std::vector<StackEntry> entries_;

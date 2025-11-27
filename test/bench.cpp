@@ -21,6 +21,10 @@
 #define UNW_LOCAL_ONLY
 #include <libunwind.h>
 
+#ifdef __APPLE__
+#include <execinfo.h>
+#endif
+
 using Clock = std::chrono::high_resolution_clock;
 using Duration = std::chrono::nanoseconds;
 
@@ -102,8 +106,12 @@ static void print_result(const BenchmarkResult& r) {
 
 __attribute__((noinline))
 static size_t libunwind_unwind() {
-    void* addresses[256];
-    int ret = unw_backtrace(addresses, 256);
+    void* addresses[512];
+#ifdef __APPLE__
+    int ret = backtrace(addresses, 512);
+#else
+    int ret = unw_backtrace(addresses, 512);
+#endif
     return (ret > 0) ? static_cast<size_t>(ret) : 0;
 }
 
@@ -114,8 +122,8 @@ static size_t libunwind_unwind() {
 __attribute__((noinline))
 static size_t ghoststack_initial_capture() {
     ghost_stack_reset();
-    void* frames[256];
-    return ghost_stack_backtrace(frames, 256);
+    void* frames[512];
+    return ghost_stack_backtrace(frames, 512);
 }
 
 //==============================================================================
@@ -124,8 +132,8 @@ static size_t ghoststack_initial_capture() {
 
 __attribute__((noinline))
 static size_t ghoststack_cached_capture() {
-    void* frames[256];
-    return ghost_stack_backtrace(frames, 256);
+    void* frames[512];
+    return ghost_stack_backtrace(frames, 512);
 }
 
 //==============================================================================
@@ -228,14 +236,14 @@ static void bench_throughput(size_t seconds) {
     printf("libunwind:  %.0f ops/sec\n", libunwind_ops_per_sec);
 
     // GhostStack cached throughput
-    void* frames[256];
-    ghost_stack_backtrace(frames, 256);  // Initial capture
+    void* frames[512];
+    ghost_stack_backtrace(frames, 512);  // Initial capture
 
     size_t ghost_ops = 0;
     start = Clock::now();
     end_time = start + std::chrono::seconds(seconds);
     while (Clock::now() < end_time) {
-        ghost_stack_backtrace(frames, 256);
+        ghost_stack_backtrace(frames, 512);
         ghost_ops++;
     }
     elapsed = std::chrono::duration_cast<Duration>(Clock::now() - start).count();
