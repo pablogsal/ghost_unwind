@@ -7,13 +7,13 @@
  *
  * When GhostStack patches a return address to point here, this trampoline:
  *   1. Saves the function's return value registers (x0-x7)
- *   2. Calls nwind_on_ret_trampoline() to get the real return address
+ *   2. Calls ghost_trampoline_handler() to get the real return address
  *   3. Restores the return value registers and branches to the real address
  *
  * Exception Handling:
  *   The trampoline includes DWARF unwind info and an LSDA so C++ exceptions
  *   propagate correctly through patched frames. When an exception passes through,
- *   control goes to .L3 which calls nwind_on_exception_through_trampoline()
+ *   control goes to .L3 which calls ghost_exception_handler()
  *   to restore the real return address before rethrowing.
  *
  * AArch64 AAPCS64 ABI Notes:
@@ -33,7 +33,7 @@
     .p2align 3,,7
 
     /* ==========================================================================
-     * nwind_ret_trampoline_start - Exception handling anchor
+     * ghost_ret_trampoline_start - Exception handling anchor
      * ==========================================================================
      * This symbol marks the start of the function for DWARF unwinding.
      * CFI directives establish exception handling context:
@@ -41,9 +41,9 @@
      *   - .cfi_lsda: Point to our Language Specific Data Area
      *   - .cfi_undefined x30: Signal that LR (return address) is non-standard
      */
-    .global    nwind_ret_trampoline_start
-    .type    nwind_ret_trampoline_start, %function
-nwind_ret_trampoline_start:
+    .global    ghost_ret_trampoline_start
+    .type    ghost_ret_trampoline_start, %function
+ghost_ret_trampoline_start:
 .LFB0:
     .cfi_startproc
     .cfi_personality 0x9b,DW.ref.__gxx_personality_v0
@@ -56,15 +56,15 @@ nwind_ret_trampoline_start:
 .LEHE0:
 
     /* ==========================================================================
-     * nwind_ret_trampoline - The actual trampoline entry point
+     * ghost_ret_trampoline - The actual trampoline entry point
      * ==========================================================================
      * When a function's return address has been patched to point here,
      * execution continues at this label upon function return (via RET).
      * The original return address is stored in GhostStack's shadow stack.
      */
-.globl nwind_ret_trampoline
-.type nwind_ret_trampoline, @function
-nwind_ret_trampoline:
+.globl ghost_ret_trampoline
+.type ghost_ret_trampoline, @function
+ghost_ret_trampoline:
 
     /* -------------------------------------------------------------------------
      * Step 1: Save return value registers
@@ -96,11 +96,11 @@ nwind_ret_trampoline:
      * Argument (x0): Pointer to original stack location
      *   = sp (current) + 64 (saved regs) = original sp
      *
-     * nwind_on_ret_trampoline() returns the real return address in x0.
+     * ghost_trampoline_handler() returns the real return address in x0.
      */
     mov x0, sp
     add x0, x0, #64             /* x0 = original stack pointer */
-    bl nwind_on_ret_trampoline  /* Call C++ handler; result in x0 */
+    bl ghost_trampoline_handler /* Call C++ handler; result in x0 */
 
     /* -------------------------------------------------------------------------
      * Step 3: Prepare return address and restore registers
@@ -140,7 +140,7 @@ nwind_ret_trampoline:
      */
 .L3:
     /* x0 already contains exception object pointer from runtime */
-    bl    nwind_on_exception_through_trampoline  /* Get real return addr */
+    bl    ghost_exception_handler   /* Get real return addr */
     mov x30, x0                 /* Restore LR with real return address */
     b     __cxa_rethrow         /* Rethrow exception (tail call) */
 
@@ -182,7 +182,7 @@ nwind_ret_trampoline:
 
 .LLSDATT0:
     .text
-    .size    nwind_ret_trampoline_start, .-nwind_ret_trampoline_start
+    .size    ghost_ret_trampoline_start, .-ghost_ret_trampoline_start
 
     /* ==========================================================================
      * Symbol references

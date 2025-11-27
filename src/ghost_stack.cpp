@@ -6,6 +6,8 @@
 
 #include "ghost_stack.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -13,6 +15,7 @@
 #include <cstring>
 #include <cxxabi.h>
 #include <mutex>
+#include <pthread.h>
 #include <vector>
 
 #define UNW_LOCAL_ONLY
@@ -23,7 +26,7 @@
 #endif
 
 // Assembly trampoline (defined in *_trampoline.s)
-extern "C" void nwind_ret_trampoline();
+extern "C" void ghost_ret_trampoline();
 
 // ============================================================================
 // Platform Configuration
@@ -126,44 +129,124 @@ public:
         return result;
     }
 
-    // Reset: restore original return addresses
+    /**
+     * Reset the shadow stack, restoring all original return addresses.
+     *
+     * This is the normal reset path - it restores the original return addresses
+     * to the stack before clearing the shadow stack entries.
+     */
     void reset() {
         if (trampolines_installed_) {
-            for (size_t i = location_; i < entries_.size(); ++i) {
+            size_t loc = location_.load(std::memory_order_acquire);
+            for (size_t i = loc; i < entries_.size(); ++i) {
                 *entries_[i].location = entries_[i].return_address;
             }
         }
+        clear_entries();
+    }
+
+private:
+    /**
+     * Internal helper to clear all state.
+     * Increments epoch to invalidate any in-flight trampoline operations.
+     */
+    void clear_entries() {
+        // Increment epoch FIRST to signal any in-flight operations
+        epoch_.fetch_add(1, std::memory_order_release);
+
         entries_.clear();
-        location_ = 0;
+        location_.store(0, std::memory_order_release);
         trampolines_installed_ = false;
     }
 
-    // Called by trampoline when a function returns
+public:
+
+    /**
+     * Called by trampoline when a function returns.
+     *
+     * Uses epoch-based validation to detect if reset() was called during
+     * execution (e.g., from a signal handler). This prevents accessing
+     * stale or cleared entries.
+     *
+     * Implements longjmp detection by comparing the current stack pointer
+     * against the expected value. If they don't match, searches forward
+     * through the shadow stack to find the matching entry (like nwind does).
+     *
+     * @param sp  Stack pointer at return time (for longjmp detection)
+     * @return    Original return address to jump to
+     */
     uintptr_t on_ret_trampoline(uintptr_t sp) {
-        if (entries_.empty() || location_ >= entries_.size()) {
+        // Capture current epoch - if it changes, reset() was called
+        uint64_t current_epoch = epoch_.load(std::memory_order_acquire);
+
+        size_t loc = location_.load(std::memory_order_acquire);
+
+        if (entries_.empty() || loc >= entries_.size()) {
             LOG_ERROR("Stack corruption in trampoline!\n");
             std::abort();
         }
 
-        auto& entry = entries_[location_++];
+        auto& entry = entries_[loc];
 
-        // Sanity check (warning only, doesn't abort)
+        // Check for longjmp: if SP doesn't match expected, search forward
+        // through shadow stack for matching entry (frames were skipped)
         if (sp != 0 && entry.stack_pointer != 0 && entry.stack_pointer != sp) {
-            LOG_DEBUG("SP mismatch: expected 0x%lx, got 0x%lx\n",
-                      entry.stack_pointer, sp);
+            LOG_DEBUG("SP mismatch at index %zu: expected 0x%lx, got 0x%lx - checking for longjmp\n",
+                      loc, entry.stack_pointer, sp);
+
+            // Search forward through shadow stack for matching SP
+            bool found = false;
+            for (size_t i = loc + 1; i < entries_.size(); ++i) {
+                if (entries_[i].stack_pointer == sp) {
+                    LOG_DEBUG("longjmp detected: found matching SP at index %zu (skipped %zu frames)\n",
+                              i, i - loc);
+
+                    // Don't restore return addresses for skipped frames - they no longer
+                    // exist on the stack after longjmp. Just skip over them.
+                    loc = i;
+                    location_.store(loc, std::memory_order_release);
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                // No matching entry found - this could be:
+                // 1. A bug in our SP calculation
+                // 2. Stack corruption
+                // 3. Some other unexpected scenario
+                // For now, log and continue with the expected entry
+                LOG_DEBUG("No matching SP found in shadow stack - continuing with current entry\n");
+            }
         }
 
-        return entry.return_address;
+        // Verify epoch hasn't changed (reset wasn't called during our execution)
+        if (epoch_.load(std::memory_order_acquire) != current_epoch) {
+            LOG_ERROR("Reset detected during trampoline - aborting\n");
+            std::abort();
+        }
+
+        // Re-read location in case it was updated during longjmp handling
+        loc = location_.load(std::memory_order_acquire);
+        uintptr_t ret_addr = entries_[loc].return_address;
+        location_.fetch_add(1, std::memory_order_acq_rel);
+        return ret_addr;
     }
 
 private:
-    // Copy cached frames to output buffer
+    /**
+     * Copy cached frames to output buffer (fast path).
+     *
+     * Called when trampolines are already installed and we can read
+     * directly from the shadow stack.
+     */
     size_t copy_cached_frames(void** buffer, size_t max_frames) {
-        size_t available = entries_.size() - location_;
+        size_t loc = location_.load(std::memory_order_acquire);
+        size_t available = entries_.size() - loc;
         size_t count = (available < max_frames) ? available : max_frames;
 
         for (size_t i = 0; i < count; ++i) {
-            buffer[i] = reinterpret_cast<void*>(entries_[location_ + i].return_address);
+            buffer[i] = reinterpret_cast<void*>(entries_[loc + i].return_address);
         }
 
         LOG_DEBUG("Fast path: %zu frames\n", count);
@@ -221,31 +304,44 @@ private:
 
             uintptr_t ret_addr = *ret_loc;
 
+            // Strip PAC (Pointer Authentication Code) if present.
+            // On ARM64 with PAC, return addresses have authentication bits
+            // that must be stripped before comparison or storage.
+            uintptr_t stripped_ret_addr = ptrauth_strip(ret_addr);
+
             // Check if already patched (cache hit)
-            if (ret_addr == reinterpret_cast<uintptr_t>(nwind_ret_trampoline)) {
+            // Compare against stripped address since trampoline address doesn't have PAC
+            if (stripped_ret_addr == reinterpret_cast<uintptr_t>(ghost_ret_trampoline)) {
                 found_existing = true;
                 LOG_DEBUG("Found existing trampoline at frame %zu\n", frame_idx);
                 break;
             }
 
-            new_entries.push_back({ret_addr, ret_loc, sp});
+            // Store the stack pointer that the trampoline will pass.
+            // The trampoline passes RSP right after landing (before its stack manipulations).
+            // When RET executes, it pops the return address, so:
+            //   RSP_trampoline = ret_loc + sizeof(void*)
+            // This allows longjmp detection by comparing against the stored value.
+            uintptr_t expected_sp = reinterpret_cast<uintptr_t>(ret_loc) + sizeof(void*);
+            new_entries.push_back({ret_addr, ret_loc, expected_sp});
             frame_idx++;
         }
 
         // Install trampolines on new entries
         for (auto& e : new_entries) {
-            *e.location = reinterpret_cast<uintptr_t>(nwind_ret_trampoline);
+            *e.location = reinterpret_cast<uintptr_t>(ghost_ret_trampoline);
         }
 
         // Merge with existing entries if we found a patched frame
         if (found_existing && !entries_.empty()) {
+            size_t loc = location_.load(std::memory_order_acquire);
             new_entries.insert(new_entries.end(),
-                               entries_.begin() + static_cast<long>(location_),
+                               entries_.begin() + static_cast<long>(loc),
                                entries_.end());
         }
 
         entries_ = std::move(new_entries);
-        location_ = 0;
+        location_.store(0, std::memory_order_release);
         trampolines_installed_ = true;
 
         // Copy to output buffer
@@ -275,24 +371,57 @@ private:
 #endif
     }
 
+    // Shadow stack entries (return addresses and their locations)
     std::vector<StackEntry> entries_;
-    size_t location_ = 0;
+
+    // Current position in the shadow stack (atomic for signal safety)
+    std::atomic<size_t> location_{0};
+
+    // Epoch counter - incremented on reset to invalidate in-flight operations
+    std::atomic<uint64_t> epoch_{0};
+
+    // Guards against recursive calls (e.g., from signal handlers during capture)
     bool is_capturing_ = false;
+
+    // Whether trampolines are currently installed
     bool trampolines_installed_ = false;
+
+    // Optional custom unwinder function
     ghost_stack_unwinder_t custom_unwinder_ = nullptr;
 };
 
 // ============================================================================
-// Thread-Local Instance
+// Thread-Local Instance Management
 // ============================================================================
 
-static thread_local GhostStackImpl* t_instance = nullptr;
+/**
+ * RAII wrapper for thread-local GhostStackImpl.
+ *
+ * When a thread exits, C++ automatically calls this destructor which resets
+ * the shadow stack (restoring original return addresses). This matches nwind's
+ * approach using pthread_key_t destructors, but uses idiomatic C++11.
+ */
+struct ThreadLocalInstance {
+    GhostStackImpl* ptr = nullptr;
+
+    ~ThreadLocalInstance() {
+        if (ptr) {
+            LOG_DEBUG("Thread exit: resetting shadow stack\n");
+            ptr->reset();
+            delete ptr;
+            ptr = nullptr;
+        }
+    }
+};
+
+static thread_local ThreadLocalInstance t_instance;
 
 static GhostStackImpl& get_instance() {
-    if (!t_instance) {
-        t_instance = new GhostStackImpl();
+    if (!t_instance.ptr) {
+        t_instance.ptr = new GhostStackImpl();
+        LOG_DEBUG("Created new shadow stack instance for thread\n");
     }
-    return *t_instance;
+    return *t_instance.ptr;
 }
 
 // ============================================================================
@@ -300,7 +429,34 @@ static GhostStackImpl& get_instance() {
 // ============================================================================
 
 static std::once_flag g_init_flag;
+static std::once_flag g_atfork_flag;
 static ghost_stack_unwinder_t g_custom_unwinder = nullptr;
+
+// ============================================================================
+// Fork Safety
+// ============================================================================
+
+/**
+ * Called in child process after fork() to reset thread-local state.
+ *
+ * After fork(), the child process has a copy of the parent's shadow stack
+ * entries. The virtual addresses are identical, so entries point to valid
+ * locations in the child's own stack. We must restore the original return
+ * addresses before the child returns through any trampolined frames.
+ */
+static void fork_child_handler() {
+    if (t_instance.ptr) {
+        t_instance.ptr->reset();
+    }
+    LOG_DEBUG("Fork child handler: reset shadow stack\n");
+}
+
+static void register_atfork_handler() {
+    std::call_once(g_atfork_flag, []() {
+        pthread_atfork(nullptr, nullptr, fork_child_handler);
+        LOG_DEBUG("Registered pthread_atfork handler\n");
+    });
+}
 
 // ============================================================================
 // C API Implementation
@@ -314,6 +470,9 @@ void ghost_stack_init(ghost_stack_unwinder_t unwinder) {
         LOG_DEBUG("Initialized with %s unwinder\n",
                   unwinder ? "custom" : "default");
     });
+
+    // Register fork handler (idempotent, safe to call multiple times)
+    register_atfork_handler();
 }
 
 size_t ghost_stack_backtrace(void** buffer, size_t size) {
@@ -321,6 +480,9 @@ size_t ghost_stack_backtrace(void** buffer, size_t size) {
     std::call_once(g_init_flag, []() {
         g_custom_unwinder = nullptr;
     });
+
+    // Ensure fork handler is registered (idempotent)
+    register_atfork_handler();
 
     auto& impl = get_instance();
 
@@ -335,25 +497,26 @@ size_t ghost_stack_backtrace(void** buffer, size_t size) {
 }
 
 void ghost_stack_reset(void) {
-    if (t_instance) {
-        t_instance->reset();
+    if (t_instance.ptr) {
+        t_instance.ptr->reset();
     }
 }
 
 void ghost_stack_thread_cleanup(void) {
-    if (t_instance) {
-        delete t_instance;
-        t_instance = nullptr;
+    if (t_instance.ptr) {
+        t_instance.ptr->reset();
+        delete t_instance.ptr;
+        t_instance.ptr = nullptr;
     }
 }
 
 // Called by assembly trampoline
-uintptr_t nwind_on_ret_trampoline(uintptr_t sp) {
+uintptr_t ghost_trampoline_handler(uintptr_t sp) {
     return get_instance().on_ret_trampoline(sp);
 }
 
 // Called when exception passes through trampoline
-uintptr_t nwind_on_exception_through_trampoline(void* exception) {
+uintptr_t ghost_exception_handler(void* exception) {
     LOG_DEBUG("Exception through trampoline\n");
 
     uintptr_t ret = get_instance().on_ret_trampoline(0);

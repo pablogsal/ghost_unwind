@@ -7,11 +7,11 @@
  *
  * When GhostStack patches a return address to point here, this trampoline:
  *   1. Saves the function's return value registers (x0-x7)
- *   2. Calls _nwind_on_ret_trampoline() to get the real return address
+ *   2. Calls _ghost_trampoline_handler() to get the real return address
  *   3. Restores the return value registers and returns to the real address
  *
  * macOS/Darwin Differences from Linux:
- *   - Symbols are prefixed with underscore (_nwind_ret_trampoline vs nwind_ret_trampoline)
+ *   - Symbols are prefixed with underscore (_ghost_ret_trampoline vs ghost_ret_trampoline)
  *   - Uses Mach-O object format instead of ELF
  *   - Section names differ (__TEXT,__text vs .text)
  *   - Exception table goes in __TEXT,__gcc_except_tab
@@ -34,7 +34,7 @@
 .p2align	2
 
 /* ==========================================================================
- * _nwind_ret_trampoline_start - Exception handling anchor
+ * _ghost_ret_trampoline_start - Exception handling anchor
  * ==========================================================================
  * This symbol marks the function start for DWARF exception handling.
  * macOS uses the same CFI mechanism as Linux but with Darwin-specific
@@ -45,10 +45,10 @@
  *   - .cfi_lsda 16: Reference to our exception handling data
  *   - .cfi_undefined lr: Signal that return address is non-standard
  */
-.globl _nwind_ret_trampoline_start
-.private_extern _nwind_ret_trampoline_start
+.globl _ghost_ret_trampoline_start
+.private_extern _ghost_ret_trampoline_start
 
-_nwind_ret_trampoline_start:
+_ghost_ret_trampoline_start:
 .cfi_startproc
 .cfi_personality 155, ___gxx_personality_v0
 .cfi_lsda 16,LLSDA0
@@ -61,15 +61,15 @@ LEHB0:
 LEHE0:
 
 /* ==========================================================================
- * _nwind_ret_trampoline - The actual trampoline entry point
+ * _ghost_ret_trampoline - The actual trampoline entry point
  * ==========================================================================
  * When a function returns through a patched return address, execution
  * lands here. We retrieve the real return address from GhostStack's
  * shadow stack and continue execution transparently.
  */
-.globl _nwind_ret_trampoline
-.private_extern _nwind_ret_trampoline
-_nwind_ret_trampoline:
+.globl _ghost_ret_trampoline
+.private_extern _ghost_ret_trampoline
+_ghost_ret_trampoline:
 
     /* -------------------------------------------------------------------------
      * Step 1: Save return value registers
@@ -100,7 +100,7 @@ _nwind_ret_trampoline:
      */
     mov x0, sp
     add x0, x0, #64             /* x0 = original stack pointer */
-    bl _nwind_on_ret_trampoline /* Call C++ handler */
+    bl _ghost_trampoline_handler /* Call C++ handler */
 
     /* -------------------------------------------------------------------------
      * Step 3: Prepare return address and restore registers
@@ -130,14 +130,14 @@ _nwind_ret_trampoline:
  * ==========================================================================
  * When a C++ exception propagates through our patched frame, the unwinder
  * uses our LSDA to find this landing pad. We:
- *   1. Call _nwind_on_exception_through_trampoline to get real return addr
+ *   1. Call _ghost_exception_handler to get real return addr
  *   2. Restore lr with the real address
  *   3. Tail-call ___cxa_rethrow to continue exception propagation
  *
  * The exception object pointer is passed in x0 by the runtime.
  */
 L3:
-    bl _nwind_on_exception_through_trampoline  /* Get real return addr in x0 */
+    bl _ghost_exception_handler /* Get real return addr in x0 */
     mov lr, x0                  /* Restore lr with real return address */
     b ___cxa_rethrow            /* Tail-call rethrow (never returns) */
 
@@ -164,9 +164,9 @@ LLSDATTD0:
     .uleb128 LLSDACSE0-LLSDACSB0    /* Call site table length */
 LLSDACSB0:
     /* Call site entry: our try region */
-    .uleb128 LEHB0-_nwind_ret_trampoline_start  /* Region start (relative) */
+    .uleb128 LEHB0-_ghost_ret_trampoline_start  /* Region start (relative) */
     .uleb128 LEHE0-LEHB0        /* Region length */
-    .uleb128 L3-_nwind_ret_trampoline_start     /* Landing pad (relative) */
+    .uleb128 L3-_ghost_ret_trampoline_start     /* Landing pad (relative) */
     .uleb128 0x1                /* Action: index 1 in action table */
 LLSDACSE0:
     .byte 0x1                   /* Action table entry */

@@ -104,6 +104,49 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(ghost_stack_bench PRIVATE unwind)
 endif()
 
+# New robustness tests
+add_executable(ghost_stack_test_longjmp
+    test/test_longjmp.cpp
+)
+target_link_libraries(ghost_stack_test_longjmp PRIVATE ghost_stack dl)
+
+add_executable(ghost_stack_test_fork
+    test/test_fork.cpp
+)
+target_link_libraries(ghost_stack_test_fork PRIVATE ghost_stack dl)
+
+add_executable(ghost_stack_test_thread_safety
+    test/test_thread_safety.cpp
+)
+target_link_libraries(ghost_stack_test_thread_safety PRIVATE ghost_stack dl pthread)
+
+# dlclose test: requires a separate shared library embedding ghost_stack
+add_library(dlclose_helper SHARED
+    test/dlclose_helper.cpp
+    src/ghost_stack.cpp
+    ${CMAKE_BINARY_DIR}/trampoline.o
+)
+
+target_include_directories(dlclose_helper PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(dlclose_helper PUBLIC unwind dl pthread)
+else()
+    target_link_libraries(dlclose_helper PUBLIC dl pthread)
+endif()
+
+set_target_properties(dlclose_helper PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+
+add_executable(ghost_stack_test_dlclose
+    test/test_dlclose.cpp
+)
+target_link_libraries(ghost_stack_test_dlclose PRIVATE dl)
+add_dependencies(ghost_stack_test_dlclose dlclose_helper)
+
 # =============================================================================
 # Examples
 # =============================================================================
@@ -142,7 +185,11 @@ add_custom_target(check
     COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test
     COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_comprehensive
     COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_exceptions
-    DEPENDS ghost_stack_test ghost_stack_test_comprehensive ghost_stack_test_exceptions
+    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_longjmp
+    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_fork
+    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_thread_safety
+    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_dlclose
+    DEPENDS ghost_stack_test ghost_stack_test_comprehensive ghost_stack_test_exceptions ghost_stack_test_longjmp ghost_stack_test_fork ghost_stack_test_thread_safety ghost_stack_test_dlclose dlclose_helper
     COMMENT "Running all tests"
 )
 
