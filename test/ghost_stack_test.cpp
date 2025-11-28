@@ -303,10 +303,16 @@ static bool compare_frames_inner() {
 
     if (n_ghost == 0 || n_ref == 0) return false;
 
-    // Find ghost_frames[0] in ref_frames
-    for (size_t i = 0; i < n_ref; i++) {
-        if (ref_frames[i] == ghost_frames[0]) {
-            return true;
+    // Both unw_backtrace and ghost_stack_backtrace return frames in
+    // newest-first order (innermost at [0], outermost at [n-1]).
+    // Check that the outermost frames (oldest) from ghost_stack appear
+    // in ref_frames. Use the last few ghost frames since they're the
+    // deepest/oldest and most likely to match.
+    for (size_t g = n_ghost > 3 ? n_ghost - 3 : 0; g < n_ghost; g++) {
+        for (size_t i = 0; i < n_ref; i++) {
+            if (ref_frames[i] == ghost_frames[g]) {
+                return true;
+            }
         }
     }
     return false;

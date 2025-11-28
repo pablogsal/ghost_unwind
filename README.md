@@ -80,37 +80,13 @@ GhostStack achieves O(1) stack capture by maintaining a **shadow stack**—a thr
 
 ### Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          First Capture (Slow Path)                      │
-├─────────────────────────────────────────────────────────────────────────┤
-│  1. libunwind walks the stack, collecting IPs and return address locs   │
-│  2. For each frame, save: {IP, original_ret_addr, stack_location, SP}   │
-│  3. Patch each return address on stack → point to trampoline            │
-│  4. Return IPs to caller                                                │
-└─────────────────────────────────────────────────────────────────────────┘
+**First Capture (Slow Path):** libunwind walks the stack, collecting IPs and return address locations. For each frame, we save `{IP, original_ret_addr, stack_location, SP}`, then patch each return address on the stack to point to the trampoline. Finally, return the IPs to the caller.
 
-┌─────────────────────────────────────────────────────────────────────────┐
-│                       Subsequent Captures (Fast Path)                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│  1. Check trampolines_installed_ flag                                   │
-│  2. memcpy IPs from shadow stack entries → output buffer                │
-│  3. Return immediately (no stack walk, no DWARF parsing)                │
-└─────────────────────────────────────────────────────────────────────────┘
-```
+**Subsequent Captures (Fast Path):** Check the `trampolines_installed_` flag, copy IPs from shadow stack entries to the output buffer, and return immediately—no stack walk, no DWARF parsing.
 
 ### Shadow Stack Data Structure
 
-Each entry in the shadow stack stores:
-
-```c
-struct StackEntry {
-    uintptr_t ip;              // Instruction pointer (what to report to caller)
-    uintptr_t return_address;  // Original return address (what we replaced)
-    uintptr_t* location;       // Memory address on stack where ret addr lives
-    uintptr_t stack_pointer;   // SP at capture time (for longjmp detection)
-};
-```
+Each entry in the shadow stack stores four values: the instruction pointer (what to report to the caller), the original return address (what we replaced), the memory address on the stack where that return address lives, and the stack pointer at capture time (used for longjmp detection).
 
 Entries are stored in **reverse order**: index 0 is the oldest frame (bottom of call stack), and the tail index points past the newest frame. This ordering allows efficient pop operations when functions return through trampolines—simply decrement the tail pointer.
 
@@ -135,165 +111,39 @@ When the function executes `ret`, instead of returning to address A, control tra
 
 ### The Trampoline
 
-The trampoline is a carefully crafted assembly routine that intercepts returns. It must:
+The trampoline is a carefully crafted assembly routine that intercepts returns. It must preserve return values (the returning function may have placed values in registers like rax/rdx on x86_64 or x0-x7 on ARM64), query the shadow stack by calling `ghost_trampoline_handler(sp)` to get the original return address, then restore the saved registers and jump to the real return address.
 
-1. **Preserve return values** — The returning function may have placed values in registers (rax/rdx on x86_64, x0-x7 on ARM64)
-2. **Query the shadow stack** — Call `ghost_trampoline_handler(sp)` to get the original return address
-3. **Restore and continue** — Pop saved registers and jump to the real return address
+On x86_64, the trampoline saves the return value registers onto the stack, aligns the stack to 16 bytes per the SysV ABI, calls the handler with the original stack pointer, then restores registers and jumps to the returned address.
 
-**x86_64 trampoline flow:**
-```asm
-ghost_ret_trampoline:
-    push rax                    ; Save return value registers
-    push rdx
-    push rcx
-    sub rsp, 8                  ; Align stack to 16 bytes (SysV ABI requirement)
-
-    mov rdi, rsp
-    add rdi, 32                 ; Pass original SP to handler
-    call ghost_trampoline_handler  ; Returns real ret addr in rax
-
-    mov rsi, rax                ; Save return address
-    add rsp, 8                  ; Remove alignment
-    pop rcx                     ; Restore return values
-    pop rdx
-    pop rax
-    jmp rsi                     ; Jump to original return address
-```
-
-**ARM64 trampoline flow:**
-```asm
-ghost_ret_trampoline:
-    sub sp, sp, #64             ; Allocate space for x0-x7
-    stp x0, x1, [sp, 0]         ; Save return value registers (AAPCS64)
-    stp x2, x3, [sp, 16]
-    stp x4, x5, [sp, 32]
-    stp x6, x7, [sp, 48]
-
-    mov x0, sp
-    add x0, x0, #64             ; Pass original SP
-    bl ghost_trampoline_handler ; Returns real ret addr in x0
-
-    mov x30, x0                 ; Move to link register
-    ldp x0, x1, [sp, 0]         ; Restore return values
-    ldp x2, x3, [sp, 16]
-    ldp x4, x5, [sp, 32]
-    ldp x6, x7, [sp, 48]
-    add sp, sp, #64
-    br x30                      ; Branch to original return address
-```
+On ARM64, the trampoline allocates space for and saves registers x0-x7 per AAPCS64, calls the handler, moves the returned address into the link register (x30), restores all saved registers, and branches to the original return address.
 
 ### Exception Handling (DWARF/LSDA)
 
-C++ exceptions use stack unwinding to find catch blocks. Without proper metadata, exceptions thrown through a patched frame would corrupt the stack. GhostStack solves this by embedding **DWARF CFI (Call Frame Information)** and an **LSDA (Language Specific Data Area)** in the trampoline:
+C++ exceptions use stack unwinding to find catch blocks. Without proper metadata, exceptions thrown through a patched frame would corrupt the stack. GhostStack solves this by embedding **DWARF CFI (Call Frame Information)** and an **LSDA (Language Specific Data Area)** in the trampoline.
 
-```
-.cfi_startproc
-.cfi_personality 0x9b, DW.ref.__gxx_personality_v0   ; Use C++ personality
-.cfi_lsda 0x1b, .LLSDA0                              ; Point to our LSDA
-.cfi_undefined rip                                    ; Return addr is "elsewhere"
-```
+The CFI directives declare that the trampoline uses the C++ personality routine for exception handling, point to our custom LSDA, and mark the return address as "undefined" (since it's stored elsewhere in the shadow stack rather than on the real stack).
 
-The LSDA defines a **catch-all handler** that:
-1. Calls `ghost_exception_handler()` to retrieve the original return address
-2. Pushes it onto the stack so the unwinder sees the correct return location
-3. Calls `__cxa_rethrow` to continue unwinding through the original call stack
-
-```
-LSDA structure:
-┌─────────────────────────────────────────┐
-│ @LPStart encoding: omit                 │
-│ @TType encoding: indirect pcrel sdata4  │
-├─────────────────────────────────────────┤
-│ Call site table:                        │
-│   Region: .LEHB0 to .LEHE0             │
-│   Landing pad: .L3                      │
-│   Action: catch-all (type 0)            │
-└─────────────────────────────────────────┘
-```
+The LSDA defines a **catch-all handler** that calls `ghost_exception_handler()` to retrieve the original return address, pushes it onto the stack so the unwinder sees the correct return location, and calls `__cxa_rethrow` to continue unwinding through the original call stack. The LSDA's call site table covers the entire trampoline region and directs all exceptions to this landing pad.
 
 ### longjmp Detection
 
-`longjmp()` bypasses normal return sequences, jumping directly to a `setjmp()` point. This leaves stale entries in the shadow stack. GhostStack detects this by comparing stack pointers:
-
-```c
-uintptr_t on_ret_trampoline(uintptr_t sp) {
-    auto& entry = entries_[tail];
-
-    // If SP doesn't match, longjmp occurred—search backward for matching frame
-    if (entry.stack_pointer != sp) {
-        for (size_t i = tail; i > 0; --i) {
-            if (entries_[i - 1].stack_pointer == sp) {
-                // Found it! Skip the bypassed frames
-                tail_.store(i - 1);
-                break;
-            }
-        }
-    }
-    return entries_[tail].return_address;
-}
-```
+`longjmp()` bypasses normal return sequences, jumping directly to a `setjmp()` point. This leaves stale entries in the shadow stack. GhostStack detects this by comparing stack pointers: when a trampoline fires, the handler compares the current stack pointer against the expected value stored in the shadow stack entry. If they don't match, a longjmp must have occurred. The handler then searches backward through the shadow stack entries to find one with a matching stack pointer, skipping all the bypassed frames, and updates the tail pointer accordingly.
 
 ### Pointer Authentication (ARM64 PAC)
 
-On ARM64 systems with PAC (Pointer Authentication Codes), return addresses contain cryptographic signatures in their upper bits. GhostStack strips these before comparison using the `xpaclri` instruction:
-
-```c
-static inline uintptr_t ptrauth_strip(uintptr_t val) {
-    uint64_t ret;
-    asm volatile(
-        "mov x30, %1\n\t"
-        "xpaclri\n\t"        // Strip PAC from LR
-        "mov %0, x30\n\t"
-        : "=r"(ret) : "r"(val) : "x30");
-    return ret;
-}
-```
+On ARM64 systems with PAC (Pointer Authentication Codes), return addresses contain cryptographic signatures in their upper bits. GhostStack strips these authentication bits before comparison using the `xpaclri` instruction, which clears the PAC bits from the link register without requiring the signing key.
 
 ### Thread Safety
 
-Each thread has its own shadow stack via C++ `thread_local` storage:
-
-```c
-static thread_local ThreadLocalInstance t_instance;
-```
-
-The `ThreadLocalInstance` wrapper ensures cleanup on thread exit—the destructor calls `reset()` to restore original return addresses before the thread's stack is deallocated.
+Each thread has its own shadow stack via C++ `thread_local` storage. A wrapper class ensures cleanup on thread exit—its destructor calls `reset()` to restore original return addresses before the thread's stack is deallocated.
 
 ### Fork Safety
 
-After `fork()`, the child process has a copy of the parent's shadow stack entries pointing to valid stack locations (virtual addresses are preserved). A `pthread_atfork()` handler ensures the child resets its shadow stack:
-
-```c
-static void fork_child_handler() {
-    if (t_instance.ptr) {
-        t_instance.ptr->reset();  // Restore original return addresses
-    }
-}
-// Registered via: pthread_atfork(NULL, NULL, fork_child_handler);
-```
+After `fork()`, the child process has a copy of the parent's shadow stack entries pointing to valid stack locations (virtual addresses are preserved). A handler registered via `pthread_atfork()` ensures the child process resets its shadow stack, restoring the original return addresses before any trampolines can fire in the forked process.
 
 ### Signal Safety
 
-An epoch counter guards against race conditions with signal handlers:
-
-```c
-std::atomic<uint64_t> epoch_{0};
-
-void reset() {
-    epoch_.fetch_add(1);  // Invalidate in-flight operations
-    // ... restore return addresses ...
-}
-
-uintptr_t on_ret_trampoline(uintptr_t sp) {
-    uint64_t current_epoch = epoch_.load();
-    // ... do work ...
-    if (epoch_.load() != current_epoch) {
-        abort();  // Reset was called mid-operation
-    }
-    return entries_[tail].return_address;
-}
-```
+An atomic epoch counter guards against race conditions with signal handlers. The `reset()` function increments the epoch before modifying any state. The trampoline handler captures the epoch at entry and verifies it hasn't changed before returning; if a signal handler called `reset()` mid-operation, the epoch mismatch triggers an abort rather than returning a potentially corrupted address.
 
 ### Performance Characteristics
 

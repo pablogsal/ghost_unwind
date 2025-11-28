@@ -158,6 +158,10 @@ public:
      * register may have already been loaded with the trampoline address before
      * we restored the stack location. We keep entries_ around to handle these
      * stale trampolines gracefully.
+     *
+     * We restore ALL entries (not just 0 to tail-1) but only if the location
+     * still contains the trampoline address. This handles the case where a
+     * location was reused by a new frame after its original trampoline fired.
      */
     void reset() {
         LOG_DEBUG("=== reset ENTER ===\n");
@@ -166,13 +170,25 @@ public:
                   tail_.load(std::memory_order_acquire));
 
         if (trampolines_installed_) {
-            size_t tail = tail_.load(std::memory_order_acquire);
-            LOG_DEBUG("  Restoring %zu return addresses\n", tail);
-            // With reversed order, iterate from 0 to tail (all entries below tail)
-            for (size_t i = 0; i < tail; ++i) {
-                LOG_DEBUG("    [%zu] location=%p, restoring 0x%lx\n",
-                          i, (void*)entries_[i].location, (unsigned long)entries_[i].return_address);
-                *entries_[i].location = entries_[i].return_address;
+            uintptr_t tramp_addr = reinterpret_cast<uintptr_t>(ghost_ret_trampoline);
+            LOG_DEBUG("  Restoring locations that still have trampoline (0x%lx)\n", (unsigned long)tramp_addr);
+
+            // Restore ALL entries whose locations still contain the trampoline.
+            // This handles both pending entries AND already-fired entries whose
+            // locations haven't been reused by new frames.
+            for (size_t i = 0; i < entries_.size(); ++i) {
+                uintptr_t current_value = *entries_[i].location;
+                // Strip PAC bits before comparison - on ARM64 with PAC enabled,
+                // the value read from stack may be PAC-signed while tramp_addr is not
+                uintptr_t stripped_value = ptrauth_strip(current_value);
+                if (stripped_value == tramp_addr) {
+                    LOG_DEBUG("    [%zu] location=%p, restoring 0x%lx\n",
+                              i, (void*)entries_[i].location, (unsigned long)entries_[i].return_address);
+                    *entries_[i].location = entries_[i].return_address;
+                } else {
+                    LOG_DEBUG("    [%zu] location=%p, skipping (current=0x%lx, not trampoline)\n",
+                              i, (void*)entries_[i].location, (unsigned long)current_value);
+                }
             }
 
             // Mark trampolines as not installed, but DON'T clear entries_!
@@ -372,7 +388,7 @@ private:
         size_t count = (available < max_frames) ? available : max_frames;
 
         for (size_t i = 0; i < count; ++i) {
-            buffer[i] = reinterpret_cast<void*>(entries_[i].ip);
+            buffer[i] = reinterpret_cast<void*>(entries_[count - 1 - i].ip);
         }
 
         LOG_DEBUG("Fast path: %zu frames\n", count);
@@ -517,9 +533,10 @@ private:
                   entries_.size(), tail_.load(std::memory_order_acquire));
 
         // Copy to output buffer - return the IP of each frame (what unw_backtrace returns)
+        // Reverse order: newest frame at buffer[0], oldest at buffer[count-1]
         size_t count = (entries_.size() < max_frames) ? entries_.size() : max_frames;
         for (size_t i = 0; i < count; ++i) {
-            buffer[i] = reinterpret_cast<void*>(entries_[i].ip);
+            buffer[i] = reinterpret_cast<void*>(entries_[count - 1 - i].ip);
         }
 
         LOG_DEBUG("=== capture_and_install EXIT, returning %zu frames ===\n", count);
