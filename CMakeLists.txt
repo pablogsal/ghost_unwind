@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.14)
 project(GhostStack VERSION 1.0)
 
 # Set C++ standard
@@ -9,6 +9,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
+
+# Enable testing
+enable_testing()
+
+# Fetch GoogleTest
+include(FetchContent)
+FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.14.0
+)
+# For Windows: Prevent overriding the parent project's compiler/linker settings
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(googletest)
 
 # Detect OS and architecture
 if(APPLE)
@@ -77,48 +91,32 @@ else()
 endif()
 
 # =============================================================================
-# Tests
+# Tests (Google Test)
 # =============================================================================
 
-add_executable(ghost_stack_test
-    test/main.cpp
+# Main Google Test suite - unified tests
+add_executable(ghost_stack_tests
+    test/ghost_stack_test.cpp
 )
-target_link_libraries(ghost_stack_test PRIVATE ghost_stack dl)
-
-add_executable(ghost_stack_test_comprehensive
-    test/test_comprehensive.cpp
+target_link_libraries(ghost_stack_tests PRIVATE
+    ghost_stack
+    dl
+    GTest::gtest_main
 )
-target_link_libraries(ghost_stack_test_comprehensive PRIVATE ghost_stack dl)
-
-add_executable(ghost_stack_test_exceptions
-    test/test_exceptions.cpp
-)
-target_link_libraries(ghost_stack_test_exceptions PRIVATE ghost_stack dl)
-
-add_executable(ghost_stack_bench
-    test/bench.cpp
-)
-target_link_libraries(ghost_stack_bench PRIVATE ghost_stack dl)
-
 if(UNIX AND NOT APPLE)
-    target_link_libraries(ghost_stack_bench PRIVATE unwind)
+    target_link_libraries(ghost_stack_tests PRIVATE unwind)
 endif()
 
-# New robustness tests
-add_executable(ghost_stack_test_longjmp
-    test/test_longjmp.cpp
-)
-target_link_libraries(ghost_stack_test_longjmp PRIVATE ghost_stack dl)
+# Register with CTest and enable test discovery
+include(GoogleTest)
+gtest_discover_tests(ghost_stack_tests)
 
+# Fork test - must be a separate executable (spawns child processes)
 add_executable(ghost_stack_test_fork
     test/test_fork.cpp
 )
 target_link_libraries(ghost_stack_test_fork PRIVATE ghost_stack dl)
-
-add_executable(ghost_stack_test_thread_safety
-    test/test_thread_safety.cpp
-)
-target_link_libraries(ghost_stack_test_thread_safety PRIVATE ghost_stack dl pthread)
+add_test(NAME ForkTest COMMAND ghost_stack_test_fork)
 
 # dlclose test: requires a separate shared library embedding ghost_stack
 add_library(dlclose_helper SHARED
@@ -146,13 +144,15 @@ add_executable(ghost_stack_test_dlclose
 )
 target_link_libraries(ghost_stack_test_dlclose PRIVATE dl)
 add_dependencies(ghost_stack_test_dlclose dlclose_helper)
+add_test(NAME DlcloseTest COMMAND ghost_stack_test_dlclose WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 
-add_executable(ghost_stack_test_libunwind_compare
-    test/test_libunwind_compare.cpp
+# Benchmark (not a test, just for performance measurement)
+add_executable(ghost_stack_bench
+    test/bench.cpp
 )
-target_link_libraries(ghost_stack_test_libunwind_compare PRIVATE ghost_stack dl)
+target_link_libraries(ghost_stack_bench PRIVATE ghost_stack dl)
 if(UNIX AND NOT APPLE)
-    target_link_libraries(ghost_stack_test_libunwind_compare PRIVATE unwind)
+    target_link_libraries(ghost_stack_bench PRIVATE unwind)
 endif()
 
 # =============================================================================
@@ -185,22 +185,6 @@ add_executable(test_read
     test/test_read.cpp
 )
 
-# =============================================================================
-# Test Target
-# =============================================================================
-
-add_custom_target(check
-    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test
-    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_comprehensive
-    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_exceptions
-    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_longjmp
-    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_fork
-    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_thread_safety
-    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_dlclose
-    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_libunwind_compare
-    DEPENDS ghost_stack_test ghost_stack_test_comprehensive ghost_stack_test_exceptions ghost_stack_test_longjmp ghost_stack_test_fork ghost_stack_test_thread_safety ghost_stack_test_dlclose ghost_stack_test_libunwind_compare dlclose_helper
-    COMMENT "Running all tests"
-)
 
 # =============================================================================
 # Install

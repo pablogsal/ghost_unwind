@@ -56,7 +56,7 @@ jobs:
       - name: Run tests
         run: |
           cd build
-          make check
+          ctest --output-on-failure --verbose
 
       - name: Run benchmark (informational)
         run: |
