@@ -37,7 +37,11 @@ static size_t wrapper_depth_1(capture_fn capture, void** frames) {
 int main() {
     printf("=== GhostStack dlclose Safety Test ===\n\n");
 
+#ifdef __APPLE__
+    void* handle = dlopen("./libdlclose_helper.dylib", RTLD_NOW);
+#else
     void* handle = dlopen("./libdlclose_helper.so", RTLD_NOW);
+#endif
     if (!handle) {
         printf("[test] FAILED: Could not open library: %s\n", dlerror());
         return 1;

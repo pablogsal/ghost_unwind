@@ -137,12 +137,27 @@ public:
      */
     void reset() {
         if (trampolines_installed_) {
-            size_t loc = location_.load(std::memory_order_acquire);
-            for (size_t i = loc; i < entries_.size(); ++i) {
+            size_t tail = tail_.load(std::memory_order_acquire);
+            // With reversed order, iterate from 0 to tail (all entries below tail)
+            for (size_t i = 0; i < tail; ++i) {
                 *entries_[i].location = entries_[i].return_address;
             }
         }
         clear_entries();
+    }
+
+public:
+    /**
+     * Direct entry access method for exception handling.
+     * Decrements tail and returns the return address without longjmp checking.
+     */
+    uintptr_t pop_entry() {
+        size_t tail = tail_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (tail >= entries_.size()) {
+            LOG_ERROR("Stack corruption in pop_entry!\n");
+            std::abort();
+        }
+        return entries_[tail].return_address;
     }
 
 private:
@@ -155,7 +170,7 @@ private:
         epoch_.fetch_add(1, std::memory_order_release);
 
         entries_.clear();
-        location_.store(0, std::memory_order_release);
+        tail_.store(0, std::memory_order_release);
         trampolines_installed_ = false;
     }
 
@@ -169,7 +184,7 @@ public:
      * stale or cleared entries.
      *
      * Implements longjmp detection by comparing the current stack pointer
-     * against the expected value. If they don't match, searches forward
+     * against the expected value. If they don't match, searches backward
      * through the shadow stack to find the matching entry (like nwind does).
      *
      * @param sp  Stack pointer at return time (for longjmp detection)
@@ -179,32 +194,35 @@ public:
         // Capture current epoch - if it changes, reset() was called
         uint64_t current_epoch = epoch_.load(std::memory_order_acquire);
 
-        size_t loc = location_.load(std::memory_order_acquire);
+        // Decrement tail first, like nwind does
+        size_t tail = tail_.fetch_sub(1, std::memory_order_acq_rel) - 1;
 
-        if (entries_.empty() || loc >= entries_.size()) {
+        if (entries_.empty() || tail >= entries_.size()) {
             LOG_ERROR("Stack corruption in trampoline!\n");
             std::abort();
         }
 
-        auto& entry = entries_[loc];
+        auto& entry = entries_[tail];
 
-        // Check for longjmp: if SP doesn't match expected, search forward
+        // Check for longjmp: if SP doesn't match expected, search backward
         // through shadow stack for matching entry (frames were skipped)
         if (sp != 0 && entry.stack_pointer != 0 && entry.stack_pointer != sp) {
             LOG_DEBUG("SP mismatch at index %zu: expected 0x%lx, got 0x%lx - checking for longjmp\n",
-                      loc, entry.stack_pointer, sp);
+                      tail, entry.stack_pointer, sp);
 
-            // Search forward through shadow stack for matching SP
+            // Search backward through shadow stack for matching SP (nwind style)
             bool found = false;
-            for (size_t i = loc + 1; i < entries_.size(); ++i) {
-                if (entries_[i].stack_pointer == sp) {
+            size_t current_tail = tail_.load(std::memory_order_acquire);
+            while (current_tail > 0) {
+                current_tail--;
+                tail_.fetch_sub(1, std::memory_order_acq_rel);
+                if (entries_[current_tail].stack_pointer == sp) {
                     LOG_DEBUG("longjmp detected: found matching SP at index %zu (skipped %zu frames)\n",
-                              i, i - loc);
+                              current_tail, tail - current_tail);
 
                     // Don't restore return addresses for skipped frames - they no longer
-                    // exist on the stack after longjmp. Just skip over them.
-                    loc = i;
-                    location_.store(loc, std::memory_order_release);
+                    // exist on the stack after longjmp. Just update our tail position.
+                    tail = current_tail;
                     found = true;
                     break;
                 }
@@ -215,7 +233,7 @@ public:
                 // 1. A bug in our SP calculation
                 // 2. Stack corruption
                 // 3. Some other unexpected scenario
-                // For now, log and continue with the expected entry
+                // For now, log and continue with the current entry
                 LOG_DEBUG("No matching SP found in shadow stack - continuing with current entry\n");
             }
         }
@@ -226,10 +244,7 @@ public:
             std::abort();
         }
 
-        // Re-read location in case it was updated during longjmp handling
-        loc = location_.load(std::memory_order_acquire);
-        uintptr_t ret_addr = entries_[loc].return_address;
-        location_.fetch_add(1, std::memory_order_acq_rel);
+        uintptr_t ret_addr = entries_[tail].return_address;
         return ret_addr;
     }
 
@@ -241,12 +256,12 @@ private:
      * directly from the shadow stack.
      */
     size_t copy_cached_frames(void** buffer, size_t max_frames) {
-        size_t loc = location_.load(std::memory_order_acquire);
-        size_t available = entries_.size() - loc;
+        size_t tail = tail_.load(std::memory_order_acquire);
+        size_t available = tail; // frames from 0 to tail-1
         size_t count = (available < max_frames) ? available : max_frames;
 
         for (size_t i = 0; i < count; ++i) {
-            buffer[i] = reinterpret_cast<void*>(entries_[loc + i].return_address);
+            buffer[i] = reinterpret_cast<void*>(entries_[i].return_address);
         }
 
         LOG_DEBUG("Fast path: %zu frames\n", count);
@@ -323,7 +338,8 @@ private:
             //   RSP_trampoline = ret_loc + sizeof(void*)
             // This allows longjmp detection by comparing against the stored value.
             uintptr_t expected_sp = reinterpret_cast<uintptr_t>(ret_loc) + sizeof(void*);
-            new_entries.push_back({ret_addr, ret_loc, expected_sp});
+            // Insert at beginning to reverse order (oldest at index 0, newest at end)
+            new_entries.insert(new_entries.begin(), {ret_addr, ret_loc, expected_sp});
             frame_idx++;
         }
 
@@ -334,14 +350,16 @@ private:
 
         // Merge with existing entries if we found a patched frame
         if (found_existing && !entries_.empty()) {
-            size_t loc = location_.load(std::memory_order_acquire);
-            new_entries.insert(new_entries.end(),
-                               entries_.begin() + static_cast<long>(loc),
-                               entries_.end());
+            size_t tail = tail_.load(std::memory_order_acquire);
+            // With reversed order, entries below tail are still valid
+            // Insert existing valid entries at the beginning of new_entries
+            new_entries.insert(new_entries.begin(),
+                               entries_.begin(),
+                               entries_.begin() + tail);
         }
 
         entries_ = std::move(new_entries);
-        location_.store(0, std::memory_order_release);
+        tail_.store(entries_.size(), std::memory_order_release);
         trampolines_installed_ = true;
 
         // Copy to output buffer
@@ -375,7 +393,7 @@ private:
     std::vector<StackEntry> entries_;
 
     // Current position in the shadow stack (atomic for signal safety)
-    std::atomic<size_t> location_{0};
+    std::atomic<size_t> tail_{0};
 
     // Epoch counter - incremented on reset to invalidate in-flight operations
     std::atomic<uint64_t> epoch_{0};
@@ -519,8 +537,9 @@ uintptr_t ghost_trampoline_handler(uintptr_t sp) {
 uintptr_t ghost_exception_handler(void* exception) {
     LOG_DEBUG("Exception through trampoline\n");
 
-    uintptr_t ret = get_instance().on_ret_trampoline(0);
-    get_instance().reset();
+    auto& impl = get_instance();
+    uintptr_t ret = impl.pop_entry();  // Direct pop, no longjmp check
+    impl.reset();
 
     __cxxabiv1::__cxa_begin_catch(exception);
     return ret;
