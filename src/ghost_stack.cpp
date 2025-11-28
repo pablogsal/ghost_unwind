@@ -299,6 +299,23 @@ private:
             unw_get_reg(&cursor, UNW_REG_IP, &ip);
             unw_get_reg(&cursor, GS_SP_REGISTER, &sp);
 
+            // On ARM64, strip PAC (Pointer Authentication Code) bits from IP.
+            // PAC-signed addresses have authentication bits in the upper bits
+            // that must be stripped for valid address comparison and symbolization.
+#ifdef GS_ARCH_AARCH64
+            ip = ptrauth_strip(ip);
+#endif
+
+            // On ARM64 Linux, unw_backtrace returns addresses adjusted by -1
+            // (to point inside the call instruction for symbolization),
+            // but unw_get_reg(UNW_REG_IP) returns the raw return address.
+            // Adjust to match unw_backtrace's behavior for consistency.
+#if defined(GS_ARCH_AARCH64) && defined(__linux__)
+            if (ip > 0) {
+                ip = ip - 1;
+            }
+#endif
+
             // Get location where return address is stored
             uintptr_t* ret_loc = nullptr;
 #ifdef __linux__
