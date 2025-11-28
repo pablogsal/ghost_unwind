@@ -147,6 +147,14 @@ add_executable(ghost_stack_test_dlclose
 target_link_libraries(ghost_stack_test_dlclose PRIVATE dl)
 add_dependencies(ghost_stack_test_dlclose dlclose_helper)
 
+add_executable(ghost_stack_test_libunwind_compare
+    test/test_libunwind_compare.cpp
+)
+target_link_libraries(ghost_stack_test_libunwind_compare PRIVATE ghost_stack dl)
+if(UNIX AND NOT APPLE)
+    target_link_libraries(ghost_stack_test_libunwind_compare PRIVATE unwind)
+endif()
+
 # =============================================================================
 # Examples
 # =============================================================================
@@ -189,7 +197,8 @@ add_custom_target(check
     COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_fork
     COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_thread_safety
     COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_dlclose
-    DEPENDS ghost_stack_test ghost_stack_test_comprehensive ghost_stack_test_exceptions ghost_stack_test_longjmp ghost_stack_test_fork ghost_stack_test_thread_safety ghost_stack_test_dlclose dlclose_helper
+    COMMAND ${CMAKE_BINARY_DIR}/ghost_stack_test_libunwind_compare
+    DEPENDS ghost_stack_test ghost_stack_test_comprehensive ghost_stack_test_exceptions ghost_stack_test_longjmp ghost_stack_test_fork ghost_stack_test_thread_safety ghost_stack_test_dlclose ghost_stack_test_libunwind_compare dlclose_helper
     COMMENT "Running all tests"
 )
 

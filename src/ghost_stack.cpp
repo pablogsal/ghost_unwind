@@ -83,7 +83,8 @@ static inline uintptr_t ptrauth_strip(uintptr_t val) { return val; }
 // ============================================================================
 
 struct StackEntry {
-    uintptr_t return_address;   // Original return address
+    uintptr_t ip;               // Instruction pointer of this frame (what to return to caller)
+    uintptr_t return_address;   // Original return address (what we replaced with trampoline)
     uintptr_t* location;        // Where it lives on the stack
     uintptr_t stack_pointer;    // SP at capture time (for validation)
 };
@@ -250,7 +251,7 @@ private:
         size_t count = (available < max_frames) ? available : max_frames;
 
         for (size_t i = 0; i < count; ++i) {
-            buffer[i] = reinterpret_cast<void*>(entries_[i].return_address);
+            buffer[i] = reinterpret_cast<void*>(entries_[i].ip);
         }
 
         LOG_DEBUG("Fast path: %zu frames\n", count);
@@ -286,8 +287,14 @@ private:
         for (int i = 0; i < 3 && unw_step(&cursor) > 0; ++i) {}
 #endif
 
+        // Process frames: read current frame, then step to next
+        // Note: After skip loop, cursor is positioned AT the first frame we want
+        // We need to read first, then step (not step-then-read)
         size_t frame_idx = 0;
-        while (unw_step(&cursor) > 0 && frame_idx < raw_count) {
+        int step_result;
+        do {
+            if (frame_idx >= raw_count) break;
+
             unw_word_t ip, sp;
             unw_get_reg(&cursor, UNW_REG_IP, &ip);
             unw_get_reg(&cursor, GS_SP_REGISTER, &sp);
@@ -327,10 +334,13 @@ private:
             //   RSP_trampoline = ret_loc + sizeof(void*)
             // This allows longjmp detection by comparing against the stored value.
             uintptr_t expected_sp = reinterpret_cast<uintptr_t>(ret_loc) + sizeof(void*);
+            // Store both IP (for returning to caller) and return_address (for trampoline restoration)
             // Insert at beginning to reverse order (oldest at index 0, newest at end)
-            new_entries.insert(new_entries.begin(), {ret_addr, ret_loc, expected_sp});
+            new_entries.insert(new_entries.begin(), {ip, ret_addr, ret_loc, expected_sp});
             frame_idx++;
-        }
+
+            step_result = unw_step(&cursor);
+        } while (step_result > 0);
 
         // Install trampolines on new entries
         for (auto& e : new_entries) {
@@ -351,10 +361,10 @@ private:
         tail_.store(entries_.size(), std::memory_order_release);
         trampolines_installed_ = true;
 
-        // Copy to output buffer
+        // Copy to output buffer - return the IP of each frame (what unw_backtrace returns)
         size_t count = (entries_.size() < max_frames) ? entries_.size() : max_frames;
         for (size_t i = 0; i < count; ++i) {
-            buffer[i] = reinterpret_cast<void*>(entries_[i].return_address);
+            buffer[i] = reinterpret_cast<void*>(entries_[i].ip);
         }
 
         LOG_DEBUG("Captured %zu frames\n", count);
