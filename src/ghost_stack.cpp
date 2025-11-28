@@ -137,6 +137,14 @@ public:
 
         // Slow path: capture with unwinder and install trampolines
         LOG_DEBUG("  Taking SLOW PATH (capture and install)\n");
+
+        // Clear any stale entries from a previous reset before starting fresh capture
+        if (!entries_.empty() && !trampolines_installed_) {
+            LOG_DEBUG("  Clearing %zu stale entries from previous reset\n", entries_.size());
+            entries_.clear();
+            tail_.store(0, std::memory_order_release);
+        }
+
         result = capture_and_install(buffer, max_frames);
         is_capturing_ = false;
         LOG_DEBUG("=== backtrace EXIT (slow path) result=%zu ===\n", result);
@@ -146,8 +154,10 @@ public:
     /**
      * Reset the shadow stack, restoring all original return addresses.
      *
-     * This is the normal reset path - it restores the original return addresses
-     * to the stack before clearing the shadow stack entries.
+     * On ARM64, stale trampolines may still fire after reset() because the LR
+     * register may have already been loaded with the trampoline address before
+     * we restored the stack location. We keep entries_ around to handle these
+     * stale trampolines gracefully.
      */
     void reset() {
         LOG_DEBUG("=== reset ENTER ===\n");
@@ -164,8 +174,17 @@ public:
                           i, (void*)entries_[i].location, (unsigned long)entries_[i].return_address);
                 *entries_[i].location = entries_[i].return_address;
             }
+
+            // Mark trampolines as not installed, but DON'T clear entries_!
+            // On ARM64, stale trampolines may still fire because LR was loaded
+            // before we restored the stack. Keep entries_ so we can still
+            // return the correct address.
+            trampolines_installed_ = false;
+
+            // Increment epoch to signal state change
+            uint64_t new_epoch = epoch_.fetch_add(1, std::memory_order_release) + 1;
+            LOG_DEBUG("  New epoch=%lu (entries preserved for stale trampolines)\n", (unsigned long)new_epoch);
         }
-        clear_entries();
         LOG_DEBUG("=== reset EXIT ===\n");
     }
 
@@ -219,30 +238,64 @@ public:
     /**
      * Called by trampoline when a function returns.
      *
-     * Uses epoch-based validation to detect if reset() was called during
-     * execution (e.g., from a signal handler). This prevents accessing
-     * stale or cleared entries.
+     * Handles three scenarios:
+     * 1. Normal operation: trampolines installed, decrement tail and return
+     * 2. Post-reset stale trampoline (ARM64): search entries by SP, don't modify state
+     * 3. Longjmp detection: SP mismatch, search backward for matching entry
      *
-     * Implements longjmp detection by comparing the current stack pointer
-     * against the expected value. If they don't match, searches backward
-     * through the shadow stack to find the matching entry (like nwind does).
-     *
-     * @param sp  Stack pointer at return time (for longjmp detection)
+     * @param sp  Stack pointer at return time (for longjmp detection / entry lookup)
      * @return    Original return address to jump to
      */
     uintptr_t on_ret_trampoline(uintptr_t sp) {
         LOG_DEBUG("=== on_ret_trampoline ENTER ===\n");
         LOG_DEBUG("  this=%p, sp=0x%lx\n", (void*)this, (unsigned long)sp);
 
-        // Capture current epoch - if it changes, reset() was called
-        uint64_t current_epoch = epoch_.load(std::memory_order_acquire);
-        LOG_DEBUG("  current_epoch=%lu\n", (unsigned long)current_epoch);
-
-        // Log state before decrement
+        // Log state
         size_t tail_before = tail_.load(std::memory_order_acquire);
         size_t entries_size = entries_.size();
         LOG_DEBUG("  BEFORE: tail_=%zu, entries_.size()=%zu, trampolines_installed_=%d\n",
                   tail_before, entries_size, (int)trampolines_installed_);
+
+        // =========================================================
+        // POST-RESET STALE TRAMPOLINE HANDLING (ARM64)
+        // =========================================================
+        // On ARM64, reset() may have been called but stale trampolines can still
+        // fire because LR was loaded before we restored the stack location.
+        // In this case, trampolines_installed_ is false but entries_ still has data.
+        //
+        // Stale trampolines fire in predictable order: the deepest pending frame
+        // (highest index that wasn't consumed) fires first, then the next one up.
+        // We simply return entries in order starting from tail_-1 and decrementing.
+        if (!trampolines_installed_ && !entries_.empty()) {
+            size_t current_tail = tail_.load(std::memory_order_acquire);
+            LOG_DEBUG("  POST-RESET stale trampoline! tail_=%zu, entries_.size()=%zu\n",
+                      current_tail, entries_.size());
+
+            if (current_tail > 0 && current_tail <= entries_.size()) {
+                // Return the entry at tail-1 (the deepest pending entry)
+                size_t idx = current_tail - 1;
+                uintptr_t ret = entries_[idx].return_address;
+
+                // Decrement tail_ for the next stale trampoline (if any)
+                tail_.store(idx, std::memory_order_release);
+
+                LOG_DEBUG("  Returning entry[%zu].return_address=0x%lx\n", idx, (unsigned long)ret);
+                LOG_DEBUG("=== on_ret_trampoline EXIT (post-reset) ===\n");
+                return ret;
+            }
+
+            // tail_ is 0 or invalid - this shouldn't happen
+            LOG_ERROR("POST-RESET trampoline: tail_=%zu is invalid!\n", current_tail);
+            LOG_ERROR("  entries_.size()=%zu\n", entries_.size());
+            std::abort();
+        }
+
+        // =========================================================
+        // NORMAL OPERATION
+        // =========================================================
+        // Capture current epoch - if it changes during execution, reset() was called
+        uint64_t current_epoch = epoch_.load(std::memory_order_acquire);
+        LOG_DEBUG("  current_epoch=%lu\n", (unsigned long)current_epoch);
 
         // Decrement tail first, like nwind does
         size_t tail = tail_.fetch_sub(1, std::memory_order_acq_rel) - 1;
