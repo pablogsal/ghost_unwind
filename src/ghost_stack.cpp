@@ -489,11 +489,19 @@ private:
             }
 
             // Store the stack pointer that the trampoline will pass.
-            // The trampoline passes RSP right after landing (before its stack manipulations).
-            // When RET executes, it pops the return address, so:
-            //   RSP_trampoline = ret_loc + sizeof(void*)
             // This allows longjmp detection by comparing against the stored value.
+#ifdef GS_ARCH_AARCH64
+            // On ARM64, the SP after return is whatever the function's epilogue set it to.
+            // The trampoline passes the actual SP at return time, so we need to store
+            // the actual SP from libunwind (not a formula based on ret_loc).
+            unw_word_t actual_sp;
+            unw_get_reg(&cursor, UNW_REG_SP, &actual_sp);
+            uintptr_t expected_sp = static_cast<uintptr_t>(actual_sp);
+#else
+            // On x86_64, RET pops the return address, so:
+            //   RSP_trampoline = ret_loc + sizeof(void*)
             uintptr_t expected_sp = reinterpret_cast<uintptr_t>(ret_loc) + sizeof(void*);
+#endif
             // Store both IP (for returning to caller) and return_address (for trampoline restoration)
             // Insert at beginning to reverse order (oldest at index 0, newest at end)
             new_entries.insert(new_entries.begin(), {ip, ret_addr, ret_loc, expected_sp});
