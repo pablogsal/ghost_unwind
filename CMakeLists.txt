@@ -95,12 +95,18 @@ endif()
 # =============================================================================
 
 # Main Google Test suite - unified tests
+# Note: We build the library sources directly into the test executable with GS_FORCE_DEBUG
+# so we get debug logging in tests without affecting the main library
 add_executable(ghost_stack_tests
     test/ghost_stack_test.cpp
+    src/ghost_stack.cpp
+    ${CMAKE_BINARY_DIR}/trampoline.o
 )
+target_include_directories(ghost_stack_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_definitions(ghost_stack_tests PRIVATE GS_FORCE_DEBUG=1)
 target_link_libraries(ghost_stack_tests PRIVATE
-    ghost_stack
     dl
+    pthread
     GTest::gtest_main
 )
 if(UNIX AND NOT APPLE)
