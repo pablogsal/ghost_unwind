@@ -211,31 +211,20 @@ public:
                       tail, entry.stack_pointer, sp);
 
             // Search backward through shadow stack for matching SP (nwind style)
-            bool found = false;
-            size_t current_tail = tail_.load(std::memory_order_acquire);
-            while (current_tail > 0) {
-                current_tail--;
-                tail_.fetch_sub(1, std::memory_order_acq_rel);
-                if (entries_[current_tail].stack_pointer == sp) {
+            // Only update tail_ if we find a match - don't corrupt it during search
+            for (size_t i = tail; i > 0; --i) {
+                if (entries_[i - 1].stack_pointer == sp) {
+                    size_t skipped = tail - (i - 1);
                     LOG_DEBUG("longjmp detected: found matching SP at index %zu (skipped %zu frames)\n",
-                              current_tail, tail - current_tail);
+                              i - 1, skipped);
 
-                    // Don't restore return addresses for skipped frames - they no longer
-                    // exist on the stack after longjmp. Just update our tail position.
-                    tail = current_tail;
-                    found = true;
+                    // Update tail_ to skip all the frames that were bypassed by longjmp
+                    tail_.store(i - 1, std::memory_order_release);
+                    tail = i - 1;
                     break;
                 }
             }
-
-            if (!found) {
-                // No matching entry found - this could be:
-                // 1. A bug in our SP calculation
-                // 2. Stack corruption
-                // 3. Some other unexpected scenario
-                // For now, log and continue with the current entry
-                LOG_DEBUG("No matching SP found in shadow stack - continuing with current entry\n");
-            }
+            // If no match found, continue with current entry (SP calculation may differ by platform)
         }
 
         // Verify epoch hasn't changed (reset wasn't called during our execution)
